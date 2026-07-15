@@ -30,13 +30,13 @@ type Server struct {
 	pool     *pgxpool.Pool
 	verifier *authclient.Verifier
 	gate     *gating.Client
-	sender   whatsapp.Sender
+	drivers  *whatsapp.Registry
 	cipher   *secrets.Cipher
 }
 
 // NewServer builds the API server.
-func NewServer(pool *pgxpool.Pool, verifier *authclient.Verifier, gate *gating.Client, sender whatsapp.Sender, cipher *secrets.Cipher) *Server {
-	return &Server{pool: pool, verifier: verifier, gate: gate, sender: sender, cipher: cipher}
+func NewServer(pool *pgxpool.Pool, verifier *authclient.Verifier, gate *gating.Client, drivers *whatsapp.Registry, cipher *secrets.Cipher) *Server {
+	return &Server{pool: pool, verifier: verifier, gate: gate, drivers: drivers, cipher: cipher}
 }
 
 // Handler returns the mux for the /api/v1 surface.
@@ -148,8 +148,8 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request, tenantID uu
 		return
 	}
 
-	// Resolve the conversation's contact phone + channel instance, send, record.
-	var phone, instance string
+	// Resolve the conversation's contact phone + channel instance/driver, send, record.
+	var phone, instance, driver string
 	if err := s.withTenant(r.Context(), tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(r.Context(),
 			`SELECT ct.phone FROM conversations c JOIN contacts ct ON ct.id = c.contact_id WHERE c.id = $1`, convID,
@@ -159,12 +159,14 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request, tenantID uu
 		return
 	}
 	if err := s.pool.QueryRow(r.Context(),
-		`SELECT evolution_instance FROM margot.tenant_channels WHERE tenant_id = $1`, tenantID,
-	).Scan(&instance); err != nil {
+		`SELECT evolution_instance, driver FROM margot.tenant_channels WHERE tenant_id = $1`, tenantID,
+	).Scan(&instance, &driver); err != nil {
 		writeErr(w, http.StatusBadRequest, "channel not configured")
 		return
 	}
-	sentID, err := s.sender.SendText(r.Context(), instance, phone, body.Text)
+	// A manual agent reply from the console is NOT billed (sender="human"); billing
+	// is per AI "resposta" and happens in the pipeline.
+	sentID, err := s.drivers.For(driver).SendText(r.Context(), instance, phone, body.Text)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "send failed")
 		return
@@ -201,19 +203,21 @@ func (s *Server) handoff(w http.ResponseWriter, r *http.Request, tenantID uuid.U
 }
 
 type configDTO struct {
-	SystemPrompt string `json:"system_prompt"`
-	Tone         string `json:"tone"`
-	Fallback     string `json:"fallback"`
-	MaxTokens    int32  `json:"max_tokens"`
-	AIModel      string `json:"ai_model"`
+	SystemPrompt             string `json:"system_prompt"`
+	Tone                     string `json:"tone"`
+	Fallback                 string `json:"fallback"`
+	MaxTokens                int32  `json:"max_tokens"`
+	AIModel                  string `json:"ai_model"`
+	Driver                   string `json:"driver"`                     // "evolution" | "meta"
+	DedicatedNumberConfirmed bool   `json:"dedicated_number_confirmed"` // onboarding requirement
 }
 
 func (s *Server) getConfig(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {
 	var c configDTO
 	err := s.pool.QueryRow(r.Context(),
-		`SELECT system_prompt, tone, fallback, max_tokens, ai_model
+		`SELECT system_prompt, tone, fallback, max_tokens, ai_model, driver, dedicated_number_confirmed
 		   FROM margot.tenant_channels WHERE tenant_id = $1`, tenantID,
-	).Scan(&c.SystemPrompt, &c.Tone, &c.Fallback, &c.MaxTokens, &c.AIModel)
+	).Scan(&c.SystemPrompt, &c.Tone, &c.Fallback, &c.MaxTokens, &c.AIModel, &c.Driver, &c.DedicatedNumberConfirmed)
 	if err == pgx.ErrNoRows {
 		writeErr(w, http.StatusNotFound, "channel not configured")
 		return
@@ -231,11 +235,15 @@ func (s *Server) putConfig(w http.ResponseWriter, r *http.Request, tenantID uuid
 		writeErr(w, http.StatusBadRequest, "invalid body")
 		return
 	}
+	if c.Driver == "" {
+		c.Driver = "evolution"
+	}
 	tag, err := s.pool.Exec(r.Context(), `
 		UPDATE margot.tenant_channels
-		   SET system_prompt = $2, tone = $3, fallback = $4, max_tokens = $5, ai_model = $6, updated_at = now()
+		   SET system_prompt = $2, tone = $3, fallback = $4, max_tokens = $5, ai_model = $6,
+		       driver = $7, dedicated_number_confirmed = $8, updated_at = now()
 		 WHERE tenant_id = $1`,
-		tenantID, c.SystemPrompt, c.Tone, c.Fallback, c.MaxTokens, c.AIModel)
+		tenantID, c.SystemPrompt, c.Tone, c.Fallback, c.MaxTokens, c.AIModel, c.Driver, c.DedicatedNumberConfirmed)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -250,11 +258,13 @@ func (s *Server) putConfig(w http.ResponseWriter, r *http.Request, tenantID uuid
 // getSetup reports onboarding status so the console can guide the client on what
 // the subscription needs (channel connected, agent configured, subscription active).
 func (s *Server) getSetup(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {
-	var instance, systemPrompt string
+	var instance, systemPrompt, driver string
+	var dedicated bool
 	channelOK := true
 	err := s.pool.QueryRow(r.Context(),
-		`SELECT COALESCE(evolution_instance, ''), system_prompt FROM margot.tenant_channels WHERE tenant_id = $1`, tenantID,
-	).Scan(&instance, &systemPrompt)
+		`SELECT COALESCE(evolution_instance, ''), system_prompt, driver, dedicated_number_confirmed
+		   FROM margot.tenant_channels WHERE tenant_id = $1`, tenantID,
+	).Scan(&instance, &systemPrompt, &driver, &dedicated)
 	if err == pgx.ErrNoRows {
 		channelOK = false
 	} else if err != nil {
@@ -266,10 +276,18 @@ func (s *Server) getSetup(w http.ResponseWriter, r *http.Request, tenantID uuid.
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// The Evolution driver requires a confirmed dedicated number before it can be
+	// considered connected (never the owner's personal/main line).
+	connected := channelOK && instance != ""
+	if driver == "evolution" {
+		connected = connected && dedicated
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"channel_connected":   channelOK && instance != "",
-		"agent_configured":    systemPrompt != "",
-		"subscription_active": active,
+		"channel_connected":          connected,
+		"agent_configured":           systemPrompt != "",
+		"subscription_active":        active,
+		"driver":                     driver,
+		"dedicated_number_confirmed": dedicated,
 	})
 }
 

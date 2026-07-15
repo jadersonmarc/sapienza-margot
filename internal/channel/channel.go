@@ -19,16 +19,18 @@ import (
 
 // TenantChannel is the per-tenant WhatsApp channel + agent config.
 type TenantChannel struct {
-	TenantID          uuid.UUID
-	EvolutionInstance string
-	WhatsappNumber    string
-	APIURL            string // per-tenant override; empty => use global env
-	APIKey            string // decrypted; empty => use global env
-	SystemPrompt      string
-	Tone              string
-	Fallback          string
-	MaxTokens         int32
-	AIModel           string
+	TenantID                 uuid.UUID
+	EvolutionInstance        string
+	WhatsappNumber           string
+	Driver                   string // "evolution" (default) | "meta"
+	DedicatedNumberConfirmed bool   // onboarding requirement before activating Evolution
+	APIURL                   string // per-tenant override; empty => use global env
+	APIKey                   string // decrypted; empty => use global env
+	SystemPrompt             string
+	Tone                     string
+	Fallback                 string
+	MaxTokens                int32
+	AIModel                  string
 }
 
 // Loader reads a channel from Postgres.
@@ -48,9 +50,11 @@ func (l *Loader) ByInstance(ctx context.Context, instance string) (TenantChannel
 	var apiURL, apiKeyEnc *string
 	err := l.pool.QueryRow(ctx, `
 		SELECT tenant_id, evolution_instance, COALESCE(whatsapp_number, ''),
+		       driver, dedicated_number_confirmed,
 		       api_url, api_key_enc, system_prompt, tone, fallback, max_tokens, ai_model
 		  FROM margot.tenant_channels WHERE evolution_instance = $1`, instance,
 	).Scan(&c.TenantID, &c.EvolutionInstance, &c.WhatsappNumber,
+		&c.Driver, &c.DedicatedNumberConfirmed,
 		&apiURL, &apiKeyEnc, &c.SystemPrompt, &c.Tone, &c.Fallback, &c.MaxTokens, &c.AIModel)
 	if err == pgx.ErrNoRows {
 		return TenantChannel{}, fmt.Errorf("no channel for instance %q", instance)

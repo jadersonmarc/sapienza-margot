@@ -48,8 +48,13 @@ func main() {
 	// Channel resolution (Evolution instance → tenant).
 	resolver := channel.NewResolver(channel.NewLoader(pool, cipher))
 
-	// Evolution sender (global server; instance routes per tenant).
-	sender := whatsapp.NewClient(os.Getenv("EVOLUTION_API_URL"), os.Getenv("EVOLUTION_API_KEY"))
+	// WhatsApp drivers: evolution (default; global server, instance routes per
+	// tenant) and meta (pluggable stub). The tenant's tenant_channels.driver picks
+	// which one is used; swapping it needs no code change.
+	drivers := whatsapp.NewRegistry("evolution",
+		whatsapp.NewClient(os.Getenv("EVOLUTION_API_URL"), os.Getenv("EVOLUTION_API_KEY")),
+		whatsapp.NewMetaDriver(),
+	)
 
 	// Claude replier (fallback-only if no key).
 	var replier agent.Replier
@@ -60,11 +65,11 @@ func main() {
 	}
 
 	gate := gating.New(pool)
-	pipe := pipeline.New(pool, sender, replier, gate)
+	pipe := pipeline.New(pool, drivers, replier, gate)
 	webhook := whatsapp.NewHandler(resolver, pipe, os.Getenv("EVOLUTION_WEBHOOK_SECRET"))
 
 	verifier := authclient.NewVerifier([]byte(mustEnv("PRODUCT_JWT_SECRET")), "sapienza-core")
-	apiServer := api.NewServer(pool, verifier, gate, sender, cipher)
+	apiServer := api.NewServer(pool, verifier, gate, drivers, cipher)
 
 	// Provisioning: apply tenant migrations on SubscriptionActivated{margot}.
 	listener := provisioning.New(pool)

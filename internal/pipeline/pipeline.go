@@ -30,7 +30,6 @@ import (
 const (
 	produto           = "margot"
 	defaultHandoffMax = 15
-	serviceWindow     = 24 * time.Hour
 	historyLimit      = 20
 	kbMatches         = 3
 )
@@ -42,18 +41,18 @@ const eventHandoffTriggered = events.Type("HandoffTriggered")
 // Pipeline processes inbound WhatsApp messages for a tenant.
 type Pipeline struct {
 	pool    *pgxpool.Pool
-	sender  whatsapp.Sender
-	replier agent.Replier // nil => reply with the tenant's fallback
+	drivers *whatsapp.Registry // resolves the tenant's driver (evolution|meta)
+	replier agent.Replier      // nil => reply with the tenant's fallback
 	gate    *gating.Client
 	rules   *rulesCache
 	now     func() time.Time
 }
 
 // New builds a Pipeline. replier may be nil (fallback-only).
-func New(pool *pgxpool.Pool, sender whatsapp.Sender, replier agent.Replier, gate *gating.Client) *Pipeline {
+func New(pool *pgxpool.Pool, drivers *whatsapp.Registry, replier agent.Replier, gate *gating.Client) *Pipeline {
 	return &Pipeline{
 		pool:    pool,
-		sender:  sender,
+		drivers: drivers,
 		replier: replier,
 		gate:    gate,
 		rules:   &rulesCache{pool: pool, ttl: 60 * time.Second},
@@ -112,7 +111,8 @@ func (p *Pipeline) Process(ctx context.Context, ch channel.TenantChannel, in wha
 	if strings.TrimSpace(reply) == "" {
 		return nil
 	}
-	return p.sendAndRecord(ctx, ch, conv.ID, in.Phone, reply, "bot")
+	// The AI-generated reply is the billable unit ("resposta").
+	return p.sendAndRecord(ctx, ch, conv.ID, in.Phone, reply, "bot", true)
 }
 
 // withTenant runs fn inside a transaction scoped to the tenant's schema.
@@ -131,11 +131,10 @@ func (p *Pipeline) withTenant(ctx context.Context, tenantID uuid.UUID, fn func(t
 	return tx.Commit(ctx)
 }
 
-// persistInbound upserts the contact/conversation, opens or extends the 24h
-// window (emitting UsageRecorded once per new window), and stores the inbound.
+// persistInbound upserts the contact/conversation and stores the inbound message.
+// Inbound is free and never billed — billing happens on the AI reply (sendAndRecord).
 func (p *Pipeline) persistInbound(ctx context.Context, ch channel.TenantChannel, in whatsapp.Inbound) (store.Conversation, error) {
 	var conv store.Conversation
-	var newWindow bool
 	err := p.withTenant(ctx, ch.TenantID, func(tx pgx.Tx) error {
 		contact, err := store.UpsertContact(ctx, tx, in.Phone, optional(in.PushName))
 		if err != nil {
@@ -145,31 +144,14 @@ func (p *Pipeline) persistInbound(ctx context.Context, ch channel.TenantChannel,
 		if err != nil {
 			return err
 		}
-		newWindow = conv.WindowStartedAt == nil || p.now().Sub(*conv.WindowStartedAt) > serviceWindow
-		if newWindow {
-			if err := store.StartWindow(ctx, tx, conv.ID); err != nil {
-				return err
-			}
-		} else if err := store.TouchConversation(ctx, tx, conv.ID); err != nil {
+		if err := store.TouchConversation(ctx, tx, conv.ID); err != nil {
 			return err
 		}
-		if _, err := store.InsertMessage(ctx, tx, store.Message{
+		_, err = store.InsertMessage(ctx, tx, store.Message{
 			ConversationID: conv.ID, Direction: "in", Sender: "contact",
 			Content: in.Text, ProviderID: optional(in.ProviderID),
-		}); err != nil {
-			return err
-		}
-		// Billable "conversa": one UsageRecorded per new 24h window, appended to
-		// the platform outbox in the SAME transaction (transactional outbox).
-		if newWindow {
-			period := p.now().UTC().Format("2006-01")
-			if _, err := events.Publish(ctx, tx, events.TypeUsageRecorded, ch.TenantID, produto, events.UsageRecorded{
-				TenantID: ch.TenantID, Produto: produto, Metric: "conversa", Count: 1, Period: period,
-			}); err != nil {
-				return err
-			}
-		}
-		return nil
+		})
+		return err
 	})
 	return conv, err
 }
@@ -212,7 +194,8 @@ func (p *Pipeline) triggerHandoff(ctx context.Context, ch channel.TenantChannel,
 
 func (p *Pipeline) applyAutomation(ctx context.Context, ch channel.TenantChannel, convID uuid.UUID, in whatsapp.Inbound, dec automation.Decision) error {
 	if dec.Reply != "" {
-		if err := p.sendAndRecord(ctx, ch, convID, in.Phone, dec.Reply, "bot"); err != nil {
+		// Automation replies are canned (not AI-generated) → not billable.
+		if err := p.sendAndRecord(ctx, ch, convID, in.Phone, dec.Reply, "bot", false); err != nil {
 			return err
 		}
 	}
@@ -252,16 +235,29 @@ func (p *Pipeline) generateReply(ctx context.Context, ch channel.TenantChannel, 
 	return p.replier.Reply(ctx, ch.AIModel, prompt, toTurns(history), int(ch.MaxTokens))
 }
 
-// sendAndRecord sends via Evolution (outside any tx), then records the outbound.
-func (p *Pipeline) sendAndRecord(ctx context.Context, ch channel.TenantChannel, convID uuid.UUID, phone, text, sender string) error {
-	sentID, err := p.sender.SendText(ctx, ch.EvolutionInstance, phone, text)
+// sendAndRecord sends via the tenant's driver (outside any tx), records the
+// outbound, and — when billable (an AI-generated reply) — emits one
+// UsageRecorded{metric:"resposta"} in the same transaction as the outbound insert.
+func (p *Pipeline) sendAndRecord(ctx context.Context, ch channel.TenantChannel, convID uuid.UUID, phone, text, sender string, billable bool) error {
+	sentID, err := p.drivers.For(ch.Driver).SendText(ctx, ch.EvolutionInstance, phone, text)
 	if err != nil {
 		return fmt.Errorf("send reply: %w", err)
 	}
 	return p.withTenant(ctx, ch.TenantID, func(tx pgx.Tx) error {
-		_, err := store.InsertMessage(ctx, tx, store.Message{
+		if _, err := store.InsertMessage(ctx, tx, store.Message{
 			ConversationID: convID, Direction: "out", Sender: sender,
 			Content: text, ProviderID: optional(sentID),
+		}); err != nil {
+			return err
+		}
+		if !billable {
+			return nil
+		}
+		// Billable "resposta": one UsageRecorded per AI reply sent, appended to the
+		// platform outbox in the SAME transaction (transactional outbox).
+		period := p.now().UTC().Format("2006-01")
+		_, err := events.Publish(ctx, tx, events.TypeUsageRecorded, ch.TenantID, produto, events.UsageRecorded{
+			TenantID: ch.TenantID, Produto: produto, Metric: "resposta", Count: 1, Period: period,
 		})
 		return err
 	})

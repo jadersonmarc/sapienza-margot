@@ -10,10 +10,38 @@ import (
 	"time"
 )
 
-// Sender delivers an outbound message and returns its provider id. The pipeline
-// depends on this seam; production uses *Client (Evolution), tests use *MockSender.
-type Sender interface {
+// WhatsAppDriver delivers an outbound message and returns its provider id. It is
+// the provider-agnostic seam the pipeline/API depend on: `evolution` (default,
+// *Client) and `meta` (pluggable, *MetaDriver) implement it, tests use *MockSender.
+// The driver is chosen per tenant (tenant_channels.driver); swapping it does not
+// touch the pipeline. Inbound is normalized to Inbound (payload.go), also agnostic.
+type WhatsAppDriver interface {
 	SendText(ctx context.Context, instance, number, text string) (string, error)
+	Name() string // "evolution" | "meta"
+}
+
+// Registry resolves a driver name to its implementation, falling back to a
+// default when the name is empty or unknown.
+type Registry struct {
+	drivers map[string]WhatsAppDriver
+	def     string
+}
+
+// NewRegistry keys the given drivers by their Name(); def is the fallback name.
+func NewRegistry(def string, drivers ...WhatsAppDriver) *Registry {
+	m := make(map[string]WhatsAppDriver, len(drivers))
+	for _, d := range drivers {
+		m[d.Name()] = d
+	}
+	return &Registry{drivers: m, def: def}
+}
+
+// For returns the driver for name, or the default when name is empty/unknown.
+func (r *Registry) For(name string) WhatsAppDriver {
+	if d, ok := r.drivers[name]; ok {
+		return d
+	}
+	return r.drivers[r.def]
 }
 
 // Client sends outbound messages through the Evolution API (copied from
@@ -32,6 +60,9 @@ func NewClient(baseURL, apiKey string) *Client {
 		http:    &http.Client{Timeout: 15 * time.Second},
 	}
 }
+
+// Name identifies the Evolution driver.
+func (c *Client) Name() string { return "evolution" }
 
 type sendTextRequest struct {
 	Number string `json:"number"`
@@ -88,6 +119,9 @@ type MockSender struct {
 	mu   sync.Mutex
 	Sent []SentMessage
 }
+
+// Name lets MockSender stand in for the evolution driver in a Registry.
+func (m *MockSender) Name() string { return "evolution" }
 
 // SendText records the message and returns a deterministic fake provider id.
 func (m *MockSender) SendText(_ context.Context, instance, number, text string) (string, error) {

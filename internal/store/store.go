@@ -47,27 +47,16 @@ func GetOrCreateConversation(ctx context.Context, tx DBTX, contactID uuid.UUID) 
 		INSERT INTO conversations (contact_id)
 		VALUES ($1)
 		ON CONFLICT (contact_id) DO UPDATE SET contact_id = EXCLUDED.contact_id
-		RETURNING id, contact_id, mode, status, window_started_at, last_message_at`,
+		RETURNING id, contact_id, mode, status, last_message_at`,
 		contactID,
-	).Scan(&c.ID, &c.ContactID, &c.Mode, &c.Status, &c.WindowStartedAt, &c.LastMessageAt)
+	).Scan(&c.ID, &c.ContactID, &c.Mode, &c.Status, &c.LastMessageAt)
 	if err != nil {
 		return Conversation{}, fmt.Errorf("get/create conversation: %w", err)
 	}
 	return c, nil
 }
 
-// StartWindow sets the conversation's 24h service window start and last message time.
-func StartWindow(ctx context.Context, tx DBTX, conversationID uuid.UUID) error {
-	_, err := tx.Exec(ctx,
-		`UPDATE conversations SET window_started_at = now(), last_message_at = now() WHERE id = $1`,
-		conversationID)
-	if err != nil {
-		return fmt.Errorf("start window: %w", err)
-	}
-	return nil
-}
-
-// TouchConversation updates last_message_at without opening a new window.
+// TouchConversation updates the conversation's last message time.
 func TouchConversation(ctx context.Context, tx DBTX, conversationID uuid.UUID) error {
 	_, err := tx.Exec(ctx, `UPDATE conversations SET last_message_at = now() WHERE id = $1`, conversationID)
 	if err != nil {

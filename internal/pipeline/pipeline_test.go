@@ -50,12 +50,12 @@ func tenantCount(t *testing.T, pool *pgxpool.Pool, tid uuid.UUID, table, where s
 	return n
 }
 
-func usageConversa(t *testing.T, pool *pgxpool.Pool, tid uuid.UUID) int {
+func usageResposta(t *testing.T, pool *pgxpool.Pool, tid uuid.UUID) int {
 	t.Helper()
 	var n int
 	err := pool.QueryRow(context.Background(),
 		`SELECT COALESCE(count,0) FROM public.usage_counters
-		 WHERE tenant_id=$1 AND produto='margot' AND metric='conversa'`, tid).Scan(&n)
+		 WHERE tenant_id=$1 AND produto='margot' AND metric='resposta'`, tid).Scan(&n)
 	if err == pgx.ErrNoRows {
 		return 0
 	}
@@ -63,6 +63,11 @@ func usageConversa(t *testing.T, pool *pgxpool.Pool, tid uuid.UUID) int {
 		t.Fatalf("usage: %v", err)
 	}
 	return n
+}
+
+// registry wraps the mock as the evolution driver for the pipeline.
+func registry(mock *whatsapp.MockSender) *whatsapp.Registry {
+	return whatsapp.NewRegistry("evolution", mock)
 }
 
 func TestTenantIsolation(t *testing.T) {
@@ -75,7 +80,7 @@ func TestTenantIsolation(t *testing.T) {
 	chB := resolveChannel(t, pool, "inst-b")
 
 	mock := &whatsapp.MockSender{}
-	p := pipeline.New(pool, mock, stubReplier{"olá"}, gating.New(pool))
+	p := pipeline.New(pool, registry(mock), stubReplier{"olá"}, gating.New(pool))
 	ctx := context.Background()
 
 	if err := p.Process(ctx, chA, inbound("inst-a", "111", "oi A")); err != nil {
@@ -104,40 +109,59 @@ func TestTenantIsolation(t *testing.T) {
 	}
 }
 
-func TestBillingConversaWindow(t *testing.T) {
+func TestBillingResposta(t *testing.T) {
 	pool := testutil.Pool(t)
 	testutil.SetupControlPlane(t, pool)
 	a := testutil.ProvisionTenant(t, pool, "inst-a")
 	ch := resolveChannel(t, pool, "inst-a")
 	ctx := context.Background()
 
-	p := pipeline.New(pool, &whatsapp.MockSender{}, stubReplier{"ok"}, gating.New(pool))
+	p := pipeline.New(pool, registry(&whatsapp.MockSender{}), stubReplier{"ok"}, gating.New(pool))
 
-	// First message opens a window → 1 conversa.
+	// Each inbound that yields an AI reply bills exactly one "resposta".
 	if err := p.Process(ctx, ch, inbound("inst-a", "111", "oi")); err != nil {
 		t.Fatal(err)
 	}
-	if got := usageConversa(t, pool, a); got != 1 {
-		t.Fatalf("após 1ª msg, conversa = %d, want 1", got)
+	if got := usageResposta(t, pool, a); got != 1 {
+		t.Fatalf("após 1 resposta da IA, resposta = %d, want 1", got)
 	}
-	// Reply within the window → still 1 (no new billable conversa).
 	if err := p.Process(ctx, ch, inbound("inst-a", "111", "tudo bem?")); err != nil {
 		t.Fatal(err)
 	}
-	if got := usageConversa(t, pool, a); got != 1 {
-		t.Fatalf("dentro da janela, conversa = %d, want 1", got)
+	if got := usageResposta(t, pool, a); got != 2 {
+		t.Fatalf("após 2 respostas da IA, resposta = %d, want 2", got)
 	}
-	// Age the window past 24h → next message opens a new conversa.
+
+	// Inbound on a human-owned conversation generates no AI reply → not billed.
 	schema := pgx.Identifier{tenancy.SchemaName(a)}.Sanitize()
+	if _, err := pool.Exec(ctx, fmt.Sprintf(`UPDATE %s.conversations SET mode='human'`, schema)); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Process(ctx, ch, inbound("inst-a", "111", "operador assume")); err != nil {
+		t.Fatal(err)
+	}
+	if got := usageResposta(t, pool, a); got != 2 {
+		t.Fatalf("entrada em conversa human não deve faturar, resposta = %d, want 2", got)
+	}
+
+	// Automation replies are canned (not AI-generated) → not billed, even though a
+	// message is sent. A fresh tenant with a welcome automation: first inbound fires
+	// the welcome, sends one outbound, bills zero.
+	b := testutil.ProvisionTenant(t, pool, "inst-b")
+	chB := resolveChannel(t, pool, "inst-b")
+	schemaB := pgx.Identifier{tenancy.SchemaName(b)}.Sanitize()
 	if _, err := pool.Exec(ctx, fmt.Sprintf(
-		`UPDATE %s.conversations SET window_started_at = now() - interval '25 hours'`, schema)); err != nil {
+		`INSERT INTO %s.automations (type, action) VALUES ('welcome', '{"reply":"Bem-vindo!"}')`, schemaB)); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Process(ctx, ch, inbound("inst-a", "111", "voltei")); err != nil {
+	if err := p.Process(ctx, chB, inbound("inst-b", "222", "olá")); err != nil {
 		t.Fatal(err)
 	}
-	if got := usageConversa(t, pool, a); got != 2 {
-		t.Fatalf("após >24h, conversa = %d, want 2", got)
+	if got := tenantCount(t, pool, b, "messages", "WHERE direction='out'"); got != 1 {
+		t.Fatalf("automação deveria enviar 1 outbound, got %d", got)
+	}
+	if got := usageResposta(t, pool, b); got != 0 {
+		t.Fatalf("automação não deve faturar resposta, got %d", got)
 	}
 }
 
@@ -149,7 +173,7 @@ func TestHandoffAfterMax(t *testing.T) {
 	ctx := context.Background()
 
 	mock := &whatsapp.MockSender{}
-	p := pipeline.New(pool, mock, stubReplier{"ok"}, gating.New(pool))
+	p := pipeline.New(pool, registry(mock), stubReplier{"ok"}, gating.New(pool))
 
 	// handoff_max=15; each exchange adds ~2 messages, so handoff fires by ~9 inbounds.
 	for i := 0; i < 12; i++ {

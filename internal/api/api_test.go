@@ -56,7 +56,7 @@ func TestAPIAuthAndIsolation(t *testing.T) {
 	b := testutil.ProvisionTenant(t, pool, "inst-b")
 
 	// Seed one conversation per tenant via the pipeline (fallback reply, no LLM).
-	p := pipeline.New(pool, &whatsapp.MockSender{}, nil, gating.New(pool))
+	p := pipeline.New(pool, whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil, gating.New(pool))
 	chA, _ := resolve(t, pool, "inst-a")
 	chB, _ := resolve(t, pool, "inst-b")
 	if err := p.Process(ctx, chA, whatsapp.Inbound{Instance: "inst-a", Phone: "111", Text: "oi A"}); err != nil {
@@ -66,7 +66,7 @@ func TestAPIAuthAndIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), &whatsapp.MockSender{}, nil)
+	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil)
 	h := srv.Handler()
 
 	// No token → 401.
@@ -96,7 +96,7 @@ func TestAPIAuthAndIsolation(t *testing.T) {
 func TestAPIRejectsInvalidToken(t *testing.T) {
 	pool := testutil.Pool(t)
 	testutil.SetupControlPlane(t, pool)
-	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), &whatsapp.MockSender{}, nil)
+	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil)
 	rec := do(srv.Handler(), "GET", "/api/v1/conversations", "not-a-jwt")
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("invalid token: status %d, want 401", rec.Code)

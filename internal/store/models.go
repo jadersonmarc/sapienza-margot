@@ -17,15 +17,14 @@ type Contact struct {
 	Consent bool
 }
 
-// Conversation groups messages with a contact. WindowStartedAt marks the start
-// of the current 24h service window (the billable "conversa" unit).
+// Conversation groups messages with a contact. Billing is per AI "resposta" (see
+// pipeline), so there is no service-window state on the conversation anymore.
 type Conversation struct {
-	ID              uuid.UUID
-	ContactID       uuid.UUID
-	Mode            string // "bot" | "human"
-	Status          string // "open" | "closed"
-	WindowStartedAt *time.Time
-	LastMessageAt   *time.Time
+	ID            uuid.UUID
+	ContactID     uuid.UUID
+	Mode          string // "bot" | "human"
+	Status        string // "open" | "closed"
+	LastMessageAt *time.Time
 }
 
 // Message is a single inbound/outbound WhatsApp message.
