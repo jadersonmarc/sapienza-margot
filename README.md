@@ -1,12 +1,14 @@
 # sapienza-margot
 
-Data plane **Margot Atendente** — atendimento por WhatsApp (Evolution API),
-multi-tenant, plugado na plataforma Sapienza (control plane `sapienza-core` + módulo
-`sapienza-kit`). Envolve o motor de conversa do `../rag-agente-go`.
+Data plane **Margot Atendente** — atendimento por WhatsApp (driver Evolution default,
+Meta plugável), multi-tenant, plugado na plataforma Sapienza (control plane
+`sapienza-core` + módulo `sapienza-kit`). Envolve o motor de conversa do
+`../rag-agente-go`. Faturamento por **resposta da IA** (entrada é grátis).
 
 ## Stack
 
-Go 1.26 · pgx/v5 · anthropic-sdk-go · Evolution API · importa `sapienza-kit`.
+Go 1.26 · pgx/v5 · anthropic-sdk-go · WhatsApp (Evolution default / Meta plugável) ·
+importa `sapienza-kit`.
 
 ## Desenvolvimento
 

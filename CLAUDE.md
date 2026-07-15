@@ -10,7 +10,8 @@ Envolve o motor de conversa do `../rag-agente-go` e o pluga no multi-tenant via
 
 - Go 1.26. Importa `github.com/jadersonmarc/sapienza-kit` (replace local `../sapienza-kit`).
 - `pgx/v5` (à mão, sem sqlc). `anthropic-sdk-go` (Claude). `google/uuid`.
-- Transporte WhatsApp: **Evolution API** (não Meta).
+- Transporte WhatsApp: **driver abstrato** — `evolution` (default) / `meta` (plugável,
+  stub), escolhido por tenant (`margot.tenant_channels.driver`).
 
 ## Comandos
 
@@ -28,9 +29,10 @@ go vet ./...
 - `db/migrations/tenant/` — tabelas por tenant (aplicadas via `kit/tenancy.MigrationRunner`).
 - `internal/secrets` — AES-256-GCM por tenant.
 - `internal/channel` — resolver `ByInstance` (cache TTL 60s) sobre `margot.tenant_channels`.
-- `internal/whatsapp` — webhook + client Evolution (+ MockSender) — de `rag-agente-go`.
+- `internal/whatsapp` — `WhatsAppDriver`/`Registry` + webhook + client Evolution + Meta
+  stub (+ MockSender) — Evolution de `rag-agente-go`.
 - `internal/claude`, `internal/agent`, `internal/automation` — copiados de `rag-agente-go`.
-- `internal/pipeline` — conversa sob `WithTenant`: CRM, billing (conversa), handoff, KB.
+- `internal/pipeline` — conversa sob `WithTenant`: CRM, billing (resposta da IA), handoff, KB.
 - `internal/store` — pgx à mão, tabelas de tenant (sem coluna tenant_id).
 - `internal/api` — API do produto (JWT do core + gating).
 
@@ -45,4 +47,5 @@ go vet ./...
 ## Restrições
 
 - Não editar `../rag-agente-go`, `../spa-sapienza`, `../sapienza-core` fora do combinado.
-- Não criar tabelas no `public`. Não usar Meta Cloud API (decisão: Evolution).
+- Não criar tabelas no `public`. WhatsApp sempre via `WhatsAppDriver` (nunca falar com
+  Evolution/Meta direto no pipeline). Número dedicado é requisito de onboarding.

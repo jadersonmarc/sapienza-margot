@@ -26,10 +26,20 @@ Sapienza (control plane `sapienza-core` + módulo `sapienza-kit`).
 5. Preço/regra vêm de `pricing.yaml` no core → lidos via `public` (`plans`,
    `product_rules`); nunca chumbados.
 
-## WhatsApp — Evolution API
+## WhatsApp — driver abstrato (Evolution default, Meta plugável)
 
-Reaproveita as integrações prontas do `rag-agente-go` (`internal/whatsapp/*`),
-adaptadas ao multi-tenant. **Não** usa Meta Cloud API (decisão do dono do produto).
+A Margot **nunca** fala com um provedor direto: fala com a interface
+`whatsapp.WhatsAppDriver`. O driver é escolhido **por tenant**
+(`margot.tenant_channels.driver`); trocar de driver não toca o pipeline.
+- **`evolution`** — **default.** WhatsApp não-oficial (Baileys) via Evolution API;
+  reaproveita as integrações do `rag-agente-go` (`internal/whatsapp/*`). Sem janela de
+  24h, sem categorias, sem cobrança de Meta por mensagem.
+- **`meta`** — Meta Cloud API oficial, **plugável (stub por ora)**. Ao ser implementado
+  voltam janela de serviço, templates e **custo por mensagem da Meta** — a considerar na
+  precificação daquele tenant.
+- **Número dedicado (requisito de onboarding):** o número conectado via Evolution
+  **deve ser dedicado**, nunca o número pessoal/principal do responsável. Confirmado em
+  `dedicated_number_confirmed` antes de considerar o canal conectado.
 - Roteamento: `evolution_instance` (UNIQUE em `margot.tenant_channels`) → tenant.
 - Envs globais da Sapienza: `EVOLUTION_API_URL`, `EVOLUTION_API_KEY`,
   `EVOLUTION_WEBHOOK_SECRET`.
@@ -37,11 +47,12 @@ adaptadas ao multi-tenant. **Não** usa Meta Cloud API (decisão do dono do prod
 ## Modelo de dados
 
 - **`margot` (schema product-global)**: `tenant_channels` (`tenant_id` PK,
-  `evolution_instance` UNIQUE, `whatsapp_number`, `api_url?`, `api_key_enc?`,
-  `system_prompt`, `tone`, `fallback`, `max_tokens`, `ai_model`, `business_hours`).
+  `evolution_instance` UNIQUE, `whatsapp_number`, `driver` default `evolution`,
+  `dedicated_number_confirmed`, `api_url?`, `api_key_enc?`, `system_prompt`, `tone`,
+  `fallback`, `max_tokens`, `ai_model`, `business_hours`).
 - **`tenant_<id>` (por tenant, via migrations de tenant)**: `contacts`,
-  `pipeline_stages`, `conversations` (+ `window_started_at`), `messages`, `handoffs`,
-  `knowledge_base`, `automations`.
+  `pipeline_stages`, `conversations`, `messages`, `handoffs`, `knowledge_base`,
+  `automations`.
 
 ## Ciclo de vida
 
@@ -52,10 +63,14 @@ adaptadas ao multi-tenant. **Não** usa Meta Cloud API (decisão do dono do prod
 
 ## Medição & regras
 
-- **Faturável = "conversa"**: abre uma janela de 24h (nova conversa ou `now -
-  window_started_at > 24h`) → `UsageRecorded{metric:"conversa",count:1}` no outbox.
+- **Faturável = "resposta"**: cada mensagem **gerada pela IA e enviada** emite
+  `UsageRecorded{metric:"resposta",count:1}` no outbox (na mesma tx do outbound).
+  **Entrada do cliente é grátis** e nunca conta; **automações** (respostas canned) e
+  **envio manual do humano** no console também **não** faturam. Excedente R$ 0,50/resposta;
+  tiers 500/1.500/5.000. Sem janela de 24h / máquina de sessão.
 - **Handoff**: `count(messages) > handoff_max_mensagens` (de `product_rules`, default 15)
-  → grava `handoffs`, emite `HandoffTriggered`, `mode='human'`, para de auto-responder.
+  → grava `handoffs`, emite `HandoffTriggered`, `mode='human'`, para de auto-responder
+  (a partir daí a IA não gera resposta, logo nada é faturado).
 - **Gating**: só auto-responde se a assinatura margot do tenant estiver ativa
   (`kit/gating.TenantCanOperate`).
 
@@ -73,6 +88,7 @@ do `spa-sapienza/lib/agent/crypto.ts`). Chave via `MARGOT_ENC_KEY`.
 
 ## Aceite
 
-Ver o plano PROMPT B. Resumo: isolamento (vazamento zero), medição de conversa (janela
-24h) refletida em `usage_counters` via trigger do core, handoff 15, auth de webhook,
-provisioning aplica migrations, gating/JWT na API. Sobe independente no Coolify.
+Ver o plano PROMPT B. Resumo: isolamento (vazamento zero), medição por **resposta**
+(saída da IA) refletida em `usage_counters` via trigger do core, handoff 15, auth de
+webhook, provisioning aplica migrations, gating/JWT na API, driver selecionável por
+tenant. Sobe independente no Coolify.

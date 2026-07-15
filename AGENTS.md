@@ -12,7 +12,7 @@ sapienza-margot/
   db/migrations/tenant/     tabelas por tenant (via kit MigrationRunner)
   internal/secrets/         AES-256-GCM (iv:tag:ciphertext)
   internal/channel/         resolver ByInstance + cache TTL
-  internal/whatsapp/        webhook + client Evolution + MockSender
+  internal/whatsapp/        WhatsAppDriver (Registry) + webhook + client Evolution + Meta stub + MockSender
   internal/claude/          adapter Claude (de rag-agente-go)
   internal/agent/           Replier seam (de rag-agente-go)
   internal/automation/      regras off-hours/welcome/keyword (de rag-agente-go)
@@ -28,9 +28,13 @@ sapienza-margot/
   numa transação. Teste de vazamento zero é aceite.
 - **Escrita em public só via `kit/events`** (append no outbox). Leitura de `public`
   (gating/plans/product_rules) é read-only.
-- **Roteamento** por `evolution_instance` (UNIQUE em `margot.tenant_channels`).
-- **Billing "conversa"**: janela 24h (`conversations.window_started_at`). Uma nova
-  janela → um `UsageRecorded`. Reentrada <24h não gera novo.
+- **Driver por tenant**: `whatsapp.WhatsAppDriver` (`evolution` default, `meta` stub),
+  escolhido por `margot.tenant_channels.driver`. Roteamento por `evolution_instance`
+  (UNIQUE em `margot.tenant_channels`). Número **dedicado** é requisito de onboarding
+  (`dedicated_number_confirmed`).
+- **Billing "resposta"**: cada resposta **gerada pela IA e enviada** emite um
+  `UsageRecorded{metric:"resposta"}` (na tx do outbound). Entrada, automações canned e
+  envio manual do humano **não** faturam. Sem janela/sessão.
 - **Handoff**: `handoff_max_mensagens` lido de `public.product_rules` (default 15).
 - **Segredos**: `internal/secrets` cifra em repouso; chave `MARGOT_ENC_KEY`. Formato
   compatível com `spa-sapienza/lib/agent/crypto.ts`.
