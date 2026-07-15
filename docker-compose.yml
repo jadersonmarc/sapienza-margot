@@ -1,0 +1,43 @@
+# Compose local do Margot. Um só Postgres (o mesmo que o core usa em produção).
+# Em produção/Coolify o Margot aponta o DATABASE_URL para o Postgres compartilhado
+# e sobe independente do core (deploy de um não derruba o outro).
+#
+# Nota: o schema `public` (subscriptions, product_rules, event_outbox + trigger) é
+# do CORE. Rode as migrations do core neste mesmo Postgres antes de operar o Margot;
+# o Margot só cria o schema `margot` e as tabelas de tenant.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: sapienza
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sapienza"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  margot:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/sapienza
+      PORT: "8081"
+      PRODUCT_JWT_SECRET: ${PRODUCT_JWT_SECRET:-troque-por-um-segredo-forte}
+      MARGOT_ENC_KEY: ${MARGOT_ENC_KEY:-}
+      EVOLUTION_API_URL: ${EVOLUTION_API_URL:-}
+      EVOLUTION_API_KEY: ${EVOLUTION_API_KEY:-}
+      EVOLUTION_WEBHOOK_SECRET: ${EVOLUTION_WEBHOOK_SECRET:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    ports:
+      - "8081:8081"
+
+volumes:
+  pgdata:
