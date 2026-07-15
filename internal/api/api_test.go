@@ -116,7 +116,7 @@ func do(h http.Handler, method, path, token string) *httptest.ResponseRecorder {
 }
 
 type convDTO struct {
-	ContactPhone string `json:"ContactPhone"`
+	ContactPhone string `json:"contact_phone"`
 }
 
 func decodeConversations(t *testing.T, rec *httptest.ResponseRecorder) []convDTO {

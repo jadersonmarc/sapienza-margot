@@ -29,14 +29,14 @@ type Conversation struct {
 
 // Message is a single inbound/outbound WhatsApp message.
 type Message struct {
-	ID             uuid.UUID
-	ConversationID uuid.UUID
-	Direction      string // "in" | "out"
-	Sender         string // "contact" | "bot" | "human"
-	Content        string
-	ProviderID     *string
-	Status         string
-	CreatedAt      time.Time
+	ID             uuid.UUID `json:"id"`
+	ConversationID uuid.UUID `json:"conversation_id"`
+	Direction      string    `json:"direction"` // "in" | "out"
+	Sender         string    `json:"sender"`    // "contact" | "bot" | "human"
+	Content        string    `json:"content"`
+	ProviderID     *string   `json:"provider_id"`
+	Status         string    `json:"status"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 // Automation is a per-tenant inbound rule (consumed by internal/automation).
@@ -59,10 +59,10 @@ type KBEntry struct {
 
 // ConversationView is a conversation joined with its contact, for the API list.
 type ConversationView struct {
-	ID            uuid.UUID
-	ContactPhone  string
-	ContactName   *string
-	Mode          string
-	Status        string
-	LastMessageAt *time.Time
+	ID            uuid.UUID  `json:"id"`
+	ContactPhone  string     `json:"contact_phone"`
+	ContactName   *string    `json:"contact_name"`
+	Mode          string     `json:"mode"`
+	Status        string     `json:"status"`
+	LastMessageAt *time.Time `json:"last_message_at"`
 }
