@@ -69,7 +69,7 @@ func main() {
 	webhook := whatsapp.NewHandler(resolver, pipe, os.Getenv("EVOLUTION_WEBHOOK_SECRET"))
 
 	verifier := authclient.NewVerifier([]byte(mustEnv("PRODUCT_JWT_SECRET")), "sapienza-core")
-	apiServer := api.NewServer(pool, verifier, gate, drivers, cipher)
+	apiServer := api.NewServer(pool, verifier, gate, drivers, cipher, resolver)
 
 	// Provisioning: apply tenant migrations on SubscriptionActivated{margot}.
 	listener := provisioning.New(pool)

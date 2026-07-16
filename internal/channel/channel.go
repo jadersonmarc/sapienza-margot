@@ -26,6 +26,7 @@ type TenantChannel struct {
 	DedicatedNumberConfirmed bool   // onboarding requirement before activating Evolution
 	APIURL                   string // per-tenant override; empty => use global env
 	APIKey                   string // decrypted; empty => use global env
+	WebhookSecret            string // decrypted; empty => fall back to the global secret
 	SystemPrompt             string
 	Tone                     string
 	Fallback                 string
@@ -47,15 +48,17 @@ func NewLoader(pool *pgxpool.Pool, cipher *secrets.Cipher) *Loader {
 // ByInstance loads the channel for an Evolution instance from margot.tenant_channels.
 func (l *Loader) ByInstance(ctx context.Context, instance string) (TenantChannel, error) {
 	var c TenantChannel
-	var apiURL, apiKeyEnc *string
+	var apiURL, apiKeyEnc, webhookSecretEnc *string
 	err := l.pool.QueryRow(ctx, `
 		SELECT tenant_id, evolution_instance, COALESCE(whatsapp_number, ''),
 		       driver, dedicated_number_confirmed,
-		       api_url, api_key_enc, system_prompt, tone, fallback, max_tokens, ai_model
+		       api_url, api_key_enc, webhook_secret_enc,
+		       system_prompt, tone, fallback, max_tokens, ai_model
 		  FROM margot.tenant_channels WHERE evolution_instance = $1`, instance,
 	).Scan(&c.TenantID, &c.EvolutionInstance, &c.WhatsappNumber,
 		&c.Driver, &c.DedicatedNumberConfirmed,
-		&apiURL, &apiKeyEnc, &c.SystemPrompt, &c.Tone, &c.Fallback, &c.MaxTokens, &c.AIModel)
+		&apiURL, &apiKeyEnc, &webhookSecretEnc,
+		&c.SystemPrompt, &c.Tone, &c.Fallback, &c.MaxTokens, &c.AIModel)
 	if err == pgx.ErrNoRows {
 		return TenantChannel{}, fmt.Errorf("no channel for instance %q", instance)
 	}
@@ -74,6 +77,16 @@ func (l *Loader) ByInstance(ctx context.Context, instance string) (TenantChannel
 			return TenantChannel{}, fmt.Errorf("decrypt api key for %q: %w", instance, err)
 		}
 		c.APIKey = key
+	}
+	if webhookSecretEnc != nil && *webhookSecretEnc != "" {
+		if l.cipher == nil {
+			return TenantChannel{}, fmt.Errorf("channel %q has an encrypted webhook secret but no cipher configured", instance)
+		}
+		s, err := l.cipher.Decrypt(*webhookSecretEnc)
+		if err != nil {
+			return TenantChannel{}, fmt.Errorf("decrypt webhook secret for %q: %w", instance, err)
+		}
+		c.WebhookSecret = s
 	}
 	return c, nil
 }

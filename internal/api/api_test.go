@@ -66,7 +66,7 @@ func TestAPIAuthAndIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil)
+	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil, nil)
 	h := srv.Handler()
 
 	// No token → 401.
@@ -96,7 +96,7 @@ func TestAPIAuthAndIsolation(t *testing.T) {
 func TestAPIRejectsInvalidToken(t *testing.T) {
 	pool := testutil.Pool(t)
 	testutil.SetupControlPlane(t, pool)
-	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil)
+	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil, nil)
 	rec := do(srv.Handler(), "GET", "/api/v1/conversations", "not-a-jwt")
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("invalid token: status %d, want 401", rec.Code)

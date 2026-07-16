@@ -6,6 +6,8 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -25,6 +27,13 @@ import (
 
 const produto = "margot"
 
+// Invalidator drops a cached channel so a config change takes effect now instead
+// of after the resolver's TTL. Satisfied by *channel.Resolver; an interface keeps
+// the API from depending on the resolver's construction.
+type Invalidator interface {
+	Invalidate(instance string)
+}
+
 // Server holds the API dependencies.
 type Server struct {
 	pool     *pgxpool.Pool
@@ -32,11 +41,12 @@ type Server struct {
 	gate     *gating.Client
 	drivers  *whatsapp.Registry
 	cipher   *secrets.Cipher
+	cache    Invalidator // may be nil (tests that don't resolve channels)
 }
 
 // NewServer builds the API server.
-func NewServer(pool *pgxpool.Pool, verifier *authclient.Verifier, gate *gating.Client, drivers *whatsapp.Registry, cipher *secrets.Cipher) *Server {
-	return &Server{pool: pool, verifier: verifier, gate: gate, drivers: drivers, cipher: cipher}
+func NewServer(pool *pgxpool.Pool, verifier *authclient.Verifier, gate *gating.Client, drivers *whatsapp.Registry, cipher *secrets.Cipher, cache Invalidator) *Server {
+	return &Server{pool: pool, verifier: verifier, gate: gate, drivers: drivers, cipher: cipher, cache: cache}
 }
 
 // Handler returns the mux for the /api/v1 surface.
@@ -49,6 +59,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/config", s.authed(s.getConfig))
 	mux.HandleFunc("PUT /api/v1/config", s.authed(s.putConfig))
 	mux.HandleFunc("GET /api/v1/setup", s.authed(s.getSetup))
+	mux.HandleFunc("POST /api/v1/channel/rotate-webhook-secret", s.authed(s.rotateWebhookSecret))
 	return mux
 }
 
@@ -227,6 +238,53 @@ func (s *Server) getConfig(w http.ResponseWriter, r *http.Request, tenantID uuid
 		return
 	}
 	writeJSON(w, http.StatusOK, c)
+}
+
+// rotateWebhookSecret mints a fresh per-tenant webhook secret, stores it
+// encrypted and returns it ONCE — it is not readable afterwards. Paste the value
+// into the Evolution instance's webhook config (header `apikey`).
+//
+// Until a tenant has its own, the webhook falls back to the global secret; after
+// rotating, only this value is accepted for this instance.
+func (s *Server) rotateWebhookSecret(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {
+	if s.cipher == nil {
+		writeErr(w, http.StatusServiceUnavailable, "MARGOT_ENC_KEY não configurada: não é possível cifrar o segredo")
+		return
+	}
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		writeErr(w, http.StatusInternalServerError, "falha ao gerar segredo")
+		return
+	}
+	secret := base64.RawURLEncoding.EncodeToString(buf)
+	enc, err := s.cipher.Encrypt(secret)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var instance string
+	err = s.pool.QueryRow(r.Context(), `
+		UPDATE margot.tenant_channels
+		   SET webhook_secret_enc = $2, updated_at = now()
+		 WHERE tenant_id = $1
+		 RETURNING evolution_instance`, tenantID, enc).Scan(&instance)
+	if err == pgx.ErrNoRows {
+		writeErr(w, http.StatusNotFound, "channel not configured")
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if s.cache != nil {
+		s.cache.Invalidate(instance) // sem isto o segredo novo só valeria após o TTL
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"instance": instance,
+		"secret":   secret,
+		"aviso":    "guarde agora: este valor não é exibido novamente. Configure-o no header `apikey` do webhook desta instância na Evolution.",
+	})
 }
 
 func (s *Server) putConfig(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {
