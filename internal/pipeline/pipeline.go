@@ -29,6 +29,7 @@ import (
 
 const (
 	produto           = "margot"
+	metricResposta    = "resposta" // billable unit: one AI reply sent
 	defaultHandoffMax = 15
 	historyLimit      = 20
 	kbMatches         = 3
@@ -63,9 +64,15 @@ func New(pool *pgxpool.Pool, drivers *whatsapp.Registry, replier agent.Replier, 
 // Process implements whatsapp.Processor.
 func (p *Pipeline) Process(ctx context.Context, ch channel.TenantChannel, in whatsapp.Inbound) error {
 	// 1) Persist inbound + billing, atomically, scoped to the tenant.
-	conv, err := p.persistInbound(ctx, ch, in)
+	conv, isNew, err := p.persistInbound(ctx, ch, in)
 	if err != nil {
 		return err
+	}
+	// Already handled in an earlier delivery of the same message (Evolution retries
+	// on error/timeout). Stop here: replying again would call the model a second
+	// time, send a duplicate to the contact and bill another "resposta".
+	if !isNew {
+		return nil
 	}
 	// Human owns the conversation: record only.
 	if conv.Mode != "bot" {
@@ -75,6 +82,13 @@ func (p *Pipeline) Process(ctx context.Context, ch channel.TenantChannel, in wha
 	if ok, err := p.gate.TenantCanOperate(ctx, ch.TenantID, produto); err != nil {
 		return err
 	} else if !ok {
+		return nil
+	}
+	// Hard cap reached: record the inbound (already persisted, shows in the console)
+	// but generate nothing — the model call is the cost we are capping.
+	if capped, err := p.gate.CapReached(ctx, ch.TenantID, produto, metricResposta); err != nil {
+		return err
+	} else if capped {
 		return nil
 	}
 
@@ -133,8 +147,13 @@ func (p *Pipeline) withTenant(ctx context.Context, tenantID uuid.UUID, fn func(t
 
 // persistInbound upserts the contact/conversation and stores the inbound message.
 // Inbound is free and never billed — billing happens on the AI reply (sendAndRecord).
-func (p *Pipeline) persistInbound(ctx context.Context, ch channel.TenantChannel, in whatsapp.Inbound) (store.Conversation, error) {
+//
+// The bool reports whether this delivery is new. False means Evolution redelivered
+// a message we already stored (same provider_id), and the caller must not act on
+// it again — see Process.
+func (p *Pipeline) persistInbound(ctx context.Context, ch channel.TenantChannel, in whatsapp.Inbound) (store.Conversation, bool, error) {
 	var conv store.Conversation
+	var isNew bool
 	err := p.withTenant(ctx, ch.TenantID, func(tx pgx.Tx) error {
 		contact, err := store.UpsertContact(ctx, tx, in.Phone, optional(in.PushName))
 		if err != nil {
@@ -147,13 +166,13 @@ func (p *Pipeline) persistInbound(ctx context.Context, ch channel.TenantChannel,
 		if err := store.TouchConversation(ctx, tx, conv.ID); err != nil {
 			return err
 		}
-		_, err = store.InsertMessage(ctx, tx, store.Message{
+		_, isNew, err = store.InsertMessageIfNew(ctx, tx, store.Message{
 			ConversationID: conv.ID, Direction: "in", Sender: "contact",
 			Content: in.Text, ProviderID: optional(in.ProviderID),
 		})
 		return err
 	})
-	return conv, err
+	return conv, isNew, err
 }
 
 func (p *Pipeline) readState(ctx context.Context, ch channel.TenantChannel, convID uuid.UUID) (int, []store.Automation, []store.Message, error) {

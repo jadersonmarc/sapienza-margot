@@ -3,7 +3,9 @@ package pipeline_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -23,6 +25,21 @@ type stubReplier struct{ reply string }
 
 func (s stubReplier) Reply(_ context.Context, _, _ string, _ []agent.Turn, _ int) (string, error) {
 	return s.reply, nil
+}
+
+// countingReplier conta as chamadas ao modelo — cada uma é custo real, então os
+// testes de idempotência e de cap asseram sobre este número, não só sobre o envio.
+type countingReplier struct {
+	mu    sync.Mutex
+	calls int
+	reply string
+}
+
+func (c *countingReplier) Reply(_ context.Context, _, _ string, _ []agent.Turn, _ int) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	return c.reply, nil
 }
 
 func inbound(instance, phone, text string) whatsapp.Inbound {
@@ -162,6 +179,100 @@ func TestBillingResposta(t *testing.T) {
 	}
 	if got := usageResposta(t, pool, b); got != 0 {
 		t.Fatalf("automação não deve faturar resposta, got %d", got)
+	}
+}
+
+// A Evolution reentrega a mensagem quando o webhook erra ou estoura o tempo. Sem
+// dedup por provider_id isso reprocessava tudo: nova chamada ao modelo (que
+// pagamos), resposta duplicada ao contato e outra "resposta" faturada.
+func TestInboundIdempotente(t *testing.T) {
+	pool := testutil.Pool(t)
+	testutil.SetupControlPlane(t, pool)
+	a := testutil.ProvisionTenant(t, pool, "inst-a")
+	ch := resolveChannel(t, pool, "inst-a")
+	ctx := context.Background()
+
+	mock := &whatsapp.MockSender{}
+	replier := &countingReplier{reply: "ok"}
+	p := pipeline.New(pool, registry(mock), replier, gating.New(pool))
+
+	// inbound() deriva ProviderID do texto: as duas entregas são a mesma mensagem.
+	in := inbound("inst-a", "111", "oi")
+	if err := p.Process(ctx, ch, in); err != nil {
+		t.Fatal(err)
+	}
+	// Reentrega (retry da Evolution).
+	if err := p.Process(ctx, ch, in); err != nil {
+		t.Fatalf("reentrega não pode virar erro (500 faria a Evolution retentar de novo): %v", err)
+	}
+
+	if got := tenantCount(t, pool, a, "messages", "WHERE direction='in'"); got != 1 {
+		t.Fatalf("a mesma mensagem foi gravada %d vezes, want 1", got)
+	}
+	if replier.calls != 1 {
+		t.Fatalf("modelo chamado %d vezes para a mesma mensagem, want 1 (custo dobrado)", replier.calls)
+	}
+	if got := len(mock.Sent); got != 1 {
+		t.Fatalf("contato recebeu %d respostas, want 1", got)
+	}
+	if got := usageResposta(t, pool, a); got != 1 {
+		t.Fatalf("resposta faturada %d vezes, want 1 (cobrança em dobro)", got)
+	}
+
+	// Mensagem diferente do mesmo contato segue normalmente.
+	if err := p.Process(ctx, ch, inbound("inst-a", "111", "outra pergunta")); err != nil {
+		t.Fatal(err)
+	}
+	if got := usageResposta(t, pool, a); got != 2 {
+		t.Fatalf("nova mensagem deve faturar, resposta = %d, want 2", got)
+	}
+}
+
+// Com hard_cap, ao atingir o incluso o bot para de gerar: o inbound continua
+// registrado (aparece no console), mas o modelo — que é o custo — não é chamado.
+func TestHardCapNaoGeraResposta(t *testing.T) {
+	pool := testutil.Pool(t)
+	testutil.SetupControlPlane(t, pool)
+	a := testutil.ProvisionTenant(t, pool, "inst-a")
+	ch := resolveChannel(t, pool, "inst-a")
+	ctx := context.Background()
+
+	// Plano start: 500 respostas incluídas; tenant no cap rígido, já no limite.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO public.plans (produto, tier, mensal, incluso, metric, excedente_unitario)
+		 VALUES ('margot','start',400,500,'resposta',0.50)
+		 ON CONFLICT (produto, tier) DO UPDATE SET incluso = EXCLUDED.incluso`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		`UPDATE public.subscriptions SET tier='start', hard_cap=true WHERE tenant_id=$1 AND produto='margot'`, a); err != nil {
+		t.Fatal(err)
+	}
+	period := time.Now().UTC().Format("2006-01")
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO public.usage_counters (tenant_id, produto, period, metric, count)
+		 VALUES ($1,'margot',$2,'resposta',500)`, a, period); err != nil {
+		t.Fatal(err)
+	}
+
+	mock := &whatsapp.MockSender{}
+	replier := &countingReplier{reply: "ok"}
+	p := pipeline.New(pool, registry(mock), replier, gating.New(pool))
+
+	if err := p.Process(ctx, ch, inbound("inst-a", "111", "oi")); err != nil {
+		t.Fatal(err)
+	}
+	if replier.calls != 0 {
+		t.Fatalf("no cap o modelo não pode ser chamado (é o custo), calls = %d", replier.calls)
+	}
+	if got := len(mock.Sent); got != 0 {
+		t.Fatalf("no cap nada deve ser enviado, got %d", got)
+	}
+	if got := tenantCount(t, pool, a, "messages", "WHERE direction='in'"); got != 1 {
+		t.Fatalf("o inbound deve continuar registrado, got %d", got)
+	}
+	if got := usageResposta(t, pool, a); got != 500 {
+		t.Fatalf("nada novo pode ser faturado no cap, resposta = %d, want 500", got)
 	}
 }
 

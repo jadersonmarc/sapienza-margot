@@ -45,6 +45,13 @@ func SetupControlPlane(t *testing.T, pool *pgxpool.Pool) {
 			PRIMARY KEY (tenant_id, produto))`,
 		`CREATE TABLE IF NOT EXISTS public.product_rules (
 			produto text PRIMARY KEY, rules jsonb NOT NULL DEFAULT '{}')`,
+		// Materializada do pricing.yaml pelo core; o kit lê `incluso` daqui para o
+		// teto de uso (gating.CapReached).
+		`CREATE TABLE IF NOT EXISTS public.plans (
+			produto text NOT NULL, tier text NOT NULL, mensal numeric NOT NULL,
+			incluso integer NOT NULL, canais integer, metric text NOT NULL,
+			excedente_unitario numeric NOT NULL,
+			PRIMARY KEY (produto, tier))`,
 		`CREATE TABLE IF NOT EXISTS public.usage_counters (
 			tenant_id uuid NOT NULL, produto text NOT NULL, period text NOT NULL,
 			metric text NOT NULL, count integer NOT NULL DEFAULT 0,
@@ -74,7 +81,7 @@ func SetupControlPlane(t *testing.T, pool *pgxpool.Pool) {
 		`DROP TRIGGER IF EXISTS event_outbox_aggregate_usage ON public.event_outbox`,
 		`CREATE TRIGGER event_outbox_aggregate_usage AFTER INSERT ON public.event_outbox
 		 FOR EACH ROW EXECUTE FUNCTION aggregate_usage_recorded()`,
-		`TRUNCATE public.subscriptions, public.product_rules, public.usage_counters,
+		`TRUNCATE public.plans, public.subscriptions, public.product_rules, public.usage_counters,
 		          public.event_outbox, bus.event_cursors`,
 		`INSERT INTO public.product_rules (produto, rules)
 		 VALUES ('margot', '{"handoff_max_mensagens": 15}')

@@ -8,6 +8,7 @@ package gating
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -26,12 +27,12 @@ func New(pool *pgxpool.Pool) *Client {
 
 // Access describes a user's relationship to a product within a tenant.
 type Access struct {
-	Member       bool   // user belongs to the tenant
-	Role         string // owner|admin|member (empty if not a member)
-	Subscribed   bool   // tenant has a subscription for the product
-	Tier         string // subscription tier (empty if not subscribed)
-	Status       string // subscription status (active|past_due|canceled|...)
-	HardCap      bool   // plan enforces a hard usage cap
+	Member     bool   // user belongs to the tenant
+	Role       string // owner|admin|member (empty if not a member)
+	Subscribed bool   // tenant has a subscription for the product
+	Tier       string // subscription tier (empty if not subscribed)
+	Status     string // subscription status (active|past_due|canceled|...)
+	HardCap    bool   // plan enforces a hard usage cap
 }
 
 // Lookup returns the full access picture for (user, tenant, produto).
@@ -115,4 +116,50 @@ func (c *Client) TenantCanOperate(ctx context.Context, tenantID uuid.UUID, produ
 		return false, err
 	}
 	return a.Subscribed && a.Status == "active", nil
+}
+
+// CapReached reports whether the tenant hit a hard usage cap for the current
+// period and must stop consuming the metric.
+//
+// Mirrors the core's rule (lib/billing/compute.ts::blockedByCap): a hard cap
+// blocks on REACHING the plan's included amount, so the included-th unit is the
+// last one allowed. Without hard_cap it never blocks — overage is billed, not
+// denied. Read-only, like the rest of this package.
+//
+// Callers should check this before spending, not after: the cost is the model
+// call, so a check that runs afterwards protects nothing.
+func (c *Client) CapReached(ctx context.Context, tenantID uuid.UUID, produto, metric string) (bool, error) {
+	a, err := c.TenantSubscription(ctx, tenantID, produto)
+	if err != nil {
+		return false, err
+	}
+	if !a.Subscribed || !a.HardCap {
+		return false, nil
+	}
+	var incluso int
+	err = c.pool.QueryRow(ctx,
+		`SELECT COALESCE(incluso, 0) FROM public.plans WHERE produto = $1 AND tier = $2`,
+		produto, a.Tier,
+	).Scan(&incluso)
+	switch {
+	case err == pgx.ErrNoRows:
+		return false, nil // sem plano materializado: não bloqueia
+	case err != nil:
+		return false, fmt.Errorf("lookup plan incluso: %w", err)
+	}
+
+	var count int
+	period := time.Now().UTC().Format("2006-01")
+	err = c.pool.QueryRow(ctx,
+		`SELECT count FROM public.usage_counters
+		  WHERE tenant_id = $1 AND produto = $2 AND period = $3 AND metric = $4`,
+		tenantID, produto, period, metric,
+	).Scan(&count)
+	switch {
+	case err == pgx.ErrNoRows:
+		return false, nil // nenhum uso no período
+	case err != nil:
+		return false, fmt.Errorf("lookup usage: %w", err)
+	}
+	return count >= incluso, nil
 }

@@ -7,6 +7,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -89,6 +90,36 @@ func InsertMessage(ctx context.Context, tx DBTX, m Message) (Message, error) {
 		return Message{}, fmt.Errorf("insert message: %w", err)
 	}
 	return m, nil
+}
+
+// InsertMessageIfNew appends a message unless one with the same provider_id is
+// already stored, reporting whether it inserted.
+//
+// This is the idempotency guard for inbound webhooks: Evolution retries on error
+// or timeout, and reprocessing a message means another model call, another reply
+// to the contact and another billed "resposta". Messages without a provider id
+// (provider_id NULL) never dedup — the partial unique index skips them.
+func InsertMessageIfNew(ctx context.Context, tx DBTX, m Message) (Message, bool, error) {
+	if m.Status == "" {
+		m.Status = "sent"
+	}
+	err := tx.QueryRow(ctx, `
+		INSERT INTO messages (conversation_id, direction, sender, content, provider_id, status)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (provider_id) WHERE provider_id IS NOT NULL DO NOTHING
+		RETURNING id, created_at`,
+		m.ConversationID, m.Direction, m.Sender, m.Content, m.ProviderID, m.Status,
+	).Scan(&m.ID, &m.CreatedAt)
+	// DO NOTHING returns no row: already seen, not an error. Letting ErrNoRows
+	// escape would 500 the webhook and make Evolution retry — the very loop this
+	// guard exists to stop.
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Message{}, false, nil
+	}
+	if err != nil {
+		return Message{}, false, fmt.Errorf("insert message if new: %w", err)
+	}
+	return m, true, nil
 }
 
 // ListRecentMessages returns the last `limit` messages of a conversation, oldest first.
