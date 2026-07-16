@@ -30,10 +30,16 @@ services:
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/sapienza
       PORT: "8081"
-      PRODUCT_JWT_SECRET: ${PRODUCT_JWT_SECRET:-troque-por-um-segredo-forte}
+      # Fail-closed (`:?`): com um default conhecido, qualquer um forja um JWT com
+      # `tid` arbitrário e lê o dado de qualquer tenant. Precisa ser o MESMO valor
+      # do core (que emite) — aqui só validamos.
+      PRODUCT_JWT_SECRET: ${PRODUCT_JWT_SECRET:?defina PRODUCT_JWT_SECRET (o MESMO valor do core)}
       MARGOT_ENC_KEY: ${MARGOT_ENC_KEY:-}
       EVOLUTION_API_URL: ${EVOLUTION_API_URL:-}
       EVOLUTION_API_KEY: ${EVOLUTION_API_KEY:-}
+      # Vazio DESLIGA a autenticação do webhook (fail-open, só p/ dev local).
+      # Em produção é obrigatório: sem ele, qualquer um injeta mensagem em
+      # qualquer tenant e queima o orçamento de LLM dele.
       EVOLUTION_WEBHOOK_SECRET: ${EVOLUTION_WEBHOOK_SECRET:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     ports:
