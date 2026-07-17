@@ -2,7 +2,15 @@
 /bin/
 *.test
 *.out
-coverage.*
+# Ancorado na raiz de propósito: sem a barra inicial, `coverage.*` casa em
+# qualquer subdiretório e engolia vendor/golang.org/x/text/{,internal/}language/
+# coverage.go — arquivos legítimos da lib. O build local passava (existem em
+# disco) e quebrava só no deploy, que compila a partir do clone.
+/coverage.*
+
+# vendor/ é entrada de build (imagem hermética, `go build -mod=vendor`): nada
+# aqui dentro pode ser ignorado, ou a imagem compila um pacote incompleto.
+!vendor/**
 
 # Env
 .env
