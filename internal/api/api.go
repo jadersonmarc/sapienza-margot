@@ -9,11 +9,13 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/jadersonmarc/sapienza-kit/authclient"
@@ -57,17 +59,30 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/conversations/{id}/send", s.authed(s.sendMessage))
 	mux.HandleFunc("POST /api/v1/conversations/{id}/handoff", s.authed(s.handoff))
 	mux.HandleFunc("GET /api/v1/config", s.authed(s.getConfig))
-	mux.HandleFunc("PUT /api/v1/config", s.authed(s.putConfig))
+	mux.HandleFunc("PUT /api/v1/config", s.authedManager(s.putConfig))
 	mux.HandleFunc("GET /api/v1/setup", s.authed(s.getSetup))
-	mux.HandleFunc("POST /api/v1/channel/rotate-webhook-secret", s.authed(s.rotateWebhookSecret))
+	mux.HandleFunc("PUT /api/v1/channel", s.authedManager(s.putChannel))
+	mux.HandleFunc("POST /api/v1/channel/rotate-webhook-secret", s.authedManager(s.rotateWebhookSecret))
 	return mux
 }
 
 type handlerFunc func(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID)
 
-// authed validates the core JWT (produto must be margot or unset) and injects
-// the tenant id. No valid token → 401.
+// authed validates the core JWT and injects the tenant id. No valid token → 401.
+// The token must be scoped to margot (produto == "margot"); um token sem a claim
+// não passa mais (antes `!= "" && != produto` deixava passar sem escopo).
 func (s *Server) authed(fn handlerFunc) http.HandlerFunc {
+	return s.guard(fn, false)
+}
+
+// authedManager is authed + requires an elevated role (owner|admin): writes de
+// config/canal não são para qualquer membro do tenant. Superadmin do core chega
+// achatado em "owner", então passa.
+func (s *Server) authedManager(fn handlerFunc) http.HandlerFunc {
+	return s.guard(fn, true)
+}
+
+func (s *Server) guard(fn handlerFunc, requireManager bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tok := bearer(r)
 		if tok == "" {
@@ -79,8 +94,12 @@ func (s *Server) authed(fn handlerFunc) http.HandlerFunc {
 			writeErr(w, http.StatusUnauthorized, "invalid token")
 			return
 		}
-		if claims.Produto != "" && claims.Produto != produto {
+		if claims.Produto != produto {
 			writeErr(w, http.StatusForbidden, "token not scoped to margot")
+			return
+		}
+		if requireManager && claims.Role != "owner" && claims.Role != "admin" {
+			writeErr(w, http.StatusForbidden, "requer papel owner ou admin")
 			return
 		}
 		fn(w, r, claims.TenantID)
@@ -213,7 +232,65 @@ func (s *Server) handoff(w http.ResponseWriter, r *http.Request, tenantID uuid.U
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+type channelDTO struct {
+	EvolutionInstance        string `json:"evolution_instance"`
+	WhatsappNumber           string `json:"whatsapp_number"`
+	Driver                   string `json:"driver"`
+	DedicatedNumberConfirmed bool   `json:"dedicated_number_confirmed"`
+}
+
+// putChannel vincula (cria/atualiza) a identidade do canal: qual instância do
+// Evolution roteia para este tenant. É o passo de onboarding que faltava — sem uma
+// linha aqui, o console mostra "canal não provisionado". Só owner/admin (na
+// prática, superadmin Sapienza; o gate duro fica no console). Os campos de agente
+// nascem no default do schema; quem os edita depois é putConfig.
+func (s *Server) putChannel(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {
+	var c channelDTO
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&c); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	c.EvolutionInstance = strings.TrimSpace(c.EvolutionInstance)
+	if c.EvolutionInstance == "" {
+		writeErr(w, http.StatusBadRequest, "evolution_instance obrigatória")
+		return
+	}
+	if c.Driver == "" {
+		c.Driver = "evolution"
+	}
+	_, err := s.pool.Exec(r.Context(), `
+		INSERT INTO margot.tenant_channels
+		       (tenant_id, evolution_instance, whatsapp_number, driver, dedicated_number_confirmed)
+		VALUES ($1, $2, NULLIF($3, ''), $4, $5)
+		ON CONFLICT (tenant_id) DO UPDATE
+		   SET evolution_instance = EXCLUDED.evolution_instance,
+		       whatsapp_number = EXCLUDED.whatsapp_number,
+		       driver = EXCLUDED.driver,
+		       dedicated_number_confirmed = EXCLUDED.dedicated_number_confirmed,
+		       updated_at = now()`,
+		tenantID, c.EvolutionInstance, c.WhatsappNumber, c.Driver, c.DedicatedNumberConfirmed)
+	if err != nil {
+		// evolution_instance é UNIQUE: outra tenant já usa essa instância.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			writeErr(w, http.StatusConflict, "instância já usada por outro tenant")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Roteamento/driver mudou: invalida o cache do resolver (senão até 60s de TTL).
+	if s.cache != nil {
+		s.cache.Invalidate(c.EvolutionInstance)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 type configDTO struct {
+	// Identidade do canal (vínculo) — read-only no getConfig; escrita via putChannel.
+	EvolutionInstance string `json:"evolution_instance"`
+	WhatsappNumber    string `json:"whatsapp_number"`
+	// Comportamento do agente — escrita via putConfig.
 	SystemPrompt             string `json:"system_prompt"`
 	Tone                     string `json:"tone"`
 	Fallback                 string `json:"fallback"`
@@ -226,9 +303,11 @@ type configDTO struct {
 func (s *Server) getConfig(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {
 	var c configDTO
 	err := s.pool.QueryRow(r.Context(),
-		`SELECT system_prompt, tone, fallback, max_tokens, ai_model, driver, dedicated_number_confirmed
+		`SELECT COALESCE(evolution_instance, ''), COALESCE(whatsapp_number, ''),
+		        system_prompt, tone, fallback, max_tokens, ai_model, driver, dedicated_number_confirmed
 		   FROM margot.tenant_channels WHERE tenant_id = $1`, tenantID,
-	).Scan(&c.SystemPrompt, &c.Tone, &c.Fallback, &c.MaxTokens, &c.AIModel, &c.Driver, &c.DedicatedNumberConfirmed)
+	).Scan(&c.EvolutionInstance, &c.WhatsappNumber,
+		&c.SystemPrompt, &c.Tone, &c.Fallback, &c.MaxTokens, &c.AIModel, &c.Driver, &c.DedicatedNumberConfirmed)
 	if err == pgx.ErrNoRows {
 		writeErr(w, http.StatusNotFound, "channel not configured")
 		return
@@ -287,21 +366,21 @@ func (s *Server) rotateWebhookSecret(w http.ResponseWriter, r *http.Request, ten
 	})
 }
 
+// putConfig edita SÓ o comportamento do agente. Identidade e roteamento do canal
+// (instância, número, driver, número dedicado) são do vínculo — putChannel,
+// superadmin — para o cliente owner/admin não mexer no roteamento por aqui.
 func (s *Server) putConfig(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {
 	var c configDTO
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&c); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	if c.Driver == "" {
-		c.Driver = "evolution"
-	}
 	tag, err := s.pool.Exec(r.Context(), `
 		UPDATE margot.tenant_channels
 		   SET system_prompt = $2, tone = $3, fallback = $4, max_tokens = $5, ai_model = $6,
-		       driver = $7, dedicated_number_confirmed = $8, updated_at = now()
+		       updated_at = now()
 		 WHERE tenant_id = $1`,
-		tenantID, c.SystemPrompt, c.Tone, c.Fallback, c.MaxTokens, c.AIModel, c.Driver, c.DedicatedNumberConfirmed)
+		tenantID, c.SystemPrompt, c.Tone, c.Fallback, c.MaxTokens, c.AIModel)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
