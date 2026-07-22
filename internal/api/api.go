@@ -36,19 +36,35 @@ type Invalidator interface {
 	Invalidate(instance string)
 }
 
+// ChannelProvisioner creates/queries the tenant's WhatsApp instance on the
+// Evolution side. Satisfied by *whatsapp.Manager; an interface so tests fake it.
+// This is what makes onboarding self-serve — the backend provisions the instance
+// and webhook, the subscriber only scans a QR.
+type ChannelProvisioner interface {
+	Configured() bool
+	CreateInstance(ctx context.Context, name, webhookURL, secret string) error
+	ConnectQR(ctx context.Context, name string) (string, error)
+	State(ctx context.Context, name string) (state, number string, err error)
+}
+
 // Server holds the API dependencies.
 type Server struct {
-	pool     *pgxpool.Pool
-	verifier *authclient.Verifier
-	gate     *gating.Client
-	drivers  *whatsapp.Registry
-	cipher   *secrets.Cipher
-	cache    Invalidator // may be nil (tests that don't resolve channels)
+	pool        *pgxpool.Pool
+	verifier    *authclient.Verifier
+	gate        *gating.Client
+	drivers     *whatsapp.Registry
+	cipher      *secrets.Cipher
+	cache       Invalidator        // may be nil (tests that don't resolve channels)
+	provisioner ChannelProvisioner // may be nil (tests that don't provision)
+	webhookURL  string             // public URL Evolution posts to (…/webhook/evolution)
 }
 
 // NewServer builds the API server.
-func NewServer(pool *pgxpool.Pool, verifier *authclient.Verifier, gate *gating.Client, drivers *whatsapp.Registry, cipher *secrets.Cipher, cache Invalidator) *Server {
-	return &Server{pool: pool, verifier: verifier, gate: gate, drivers: drivers, cipher: cipher, cache: cache}
+func NewServer(pool *pgxpool.Pool, verifier *authclient.Verifier, gate *gating.Client, drivers *whatsapp.Registry, cipher *secrets.Cipher, cache Invalidator, provisioner ChannelProvisioner, webhookURL string) *Server {
+	return &Server{
+		pool: pool, verifier: verifier, gate: gate, drivers: drivers,
+		cipher: cipher, cache: cache, provisioner: provisioner, webhookURL: webhookURL,
+	}
 }
 
 // Handler returns the mux for the /api/v1 surface.
@@ -61,9 +77,125 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/config", s.authed(s.getConfig))
 	mux.HandleFunc("PUT /api/v1/config", s.authedManager(s.putConfig))
 	mux.HandleFunc("GET /api/v1/setup", s.authed(s.getSetup))
+	// Onboarding self-serve (owner/admin): conecta o WhatsApp por QR.
+	mux.HandleFunc("POST /api/v1/channel/connect", s.authedManager(s.connectChannel))
+	mux.HandleFunc("GET /api/v1/channel/status", s.authedManager(s.channelStatus))
+	// Fallback manual (superadmin / driver meta), fora da jornada do cliente.
 	mux.HandleFunc("PUT /api/v1/channel", s.authedManager(s.putChannel))
 	mux.HandleFunc("POST /api/v1/channel/rotate-webhook-secret", s.authedManager(s.rotateWebhookSecret))
 	return mux
+}
+
+// instanceName deriva o nome da instância Evolution do tenant — determinístico e
+// oculto do usuário (o assinante nunca digita instância).
+func instanceName(tenantID uuid.UUID) string {
+	return "margot-" + strings.ReplaceAll(tenantID.String(), "-", "")
+}
+
+// connectChannel provisiona o WhatsApp do tenant e devolve o QR para escanear.
+// Idempotente: cria a instância no Evolution com o webhook já embutido (ou reusa
+// a existente), grava a linha em tenant_channels e busca o QR atual. O segredo do
+// webhook é gerado e cifrado aqui — o cliente nunca o vê.
+func (s *Server) connectChannel(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {
+	if s.cipher == nil {
+		writeErr(w, http.StatusServiceUnavailable, "MARGOT_ENC_KEY não configurada")
+		return
+	}
+	if s.provisioner == nil || !s.provisioner.Configured() {
+		writeErr(w, http.StatusServiceUnavailable, "Evolution API não configurada (EVOLUTION_API_URL/KEY)")
+		return
+	}
+	name := instanceName(tenantID)
+
+	// Reusa o segredo já gravado (para o webhook no Evolution seguir batendo);
+	// só gera um novo se o canal ainda não tem.
+	var existingEnc *string
+	_ = s.pool.QueryRow(r.Context(),
+		`SELECT webhook_secret_enc FROM margot.tenant_channels WHERE tenant_id = $1`, tenantID).Scan(&existingEnc)
+	var secret, enc string
+	if existingEnc != nil && *existingEnc != "" {
+		s2, err := s.cipher.Decrypt(*existingEnc)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "falha ao ler segredo do webhook")
+			return
+		}
+		secret, enc = s2, *existingEnc
+	} else {
+		buf := make([]byte, 32)
+		if _, err := rand.Read(buf); err != nil {
+			writeErr(w, http.StatusInternalServerError, "falha ao gerar segredo")
+			return
+		}
+		secret = base64.RawURLEncoding.EncodeToString(buf)
+		e, err := s.cipher.Encrypt(secret)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		enc = e
+	}
+
+	if err := s.provisioner.CreateInstance(r.Context(), name, s.webhookURL, secret); err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if _, err := s.pool.Exec(r.Context(), `
+		INSERT INTO margot.tenant_channels (tenant_id, evolution_instance, driver, webhook_secret_enc)
+		VALUES ($1, $2, 'evolution', $3)
+		ON CONFLICT (tenant_id) DO UPDATE
+		   SET evolution_instance = EXCLUDED.evolution_instance,
+		       driver = 'evolution',
+		       webhook_secret_enc = EXCLUDED.webhook_secret_enc,
+		       updated_at = now()`,
+		tenantID, name, enc); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if s.cache != nil {
+		s.cache.Invalidate(name)
+	}
+	qr, err := s.provisioner.ConnectQR(r.Context(), name)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"qr_base64": qr})
+}
+
+// channelStatus reporta o estado da conexão (o console faz polling). Quando
+// conecta (state=open), captura o número e marca o canal como pronto.
+func (s *Server) channelStatus(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {
+	var instance string
+	err := s.pool.QueryRow(r.Context(),
+		`SELECT evolution_instance FROM margot.tenant_channels WHERE tenant_id = $1`, tenantID).Scan(&instance)
+	if err == pgx.ErrNoRows {
+		writeJSON(w, http.StatusOK, map[string]any{"connected": false, "state": "none"})
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if s.provisioner == nil || !s.provisioner.Configured() {
+		writeErr(w, http.StatusServiceUnavailable, "Evolution API não configurada")
+		return
+	}
+	state, number, err := s.provisioner.State(r.Context(), instance)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	connected := state == "open"
+	if connected {
+		// Grava o número conectado e considera o número dedicado confirmado (o
+		// assinante escaneou um número que ele escolheu como dedicado).
+		_, _ = s.pool.Exec(r.Context(), `
+			UPDATE margot.tenant_channels
+			   SET whatsapp_number = COALESCE(NULLIF(whatsapp_number, ''), NULLIF($2, '')),
+			       dedicated_number_confirmed = true, updated_at = now()
+			 WHERE tenant_id = $1`, tenantID, number)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"connected": connected, "state": state, "number": number})
 }
 
 type handlerFunc func(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID)

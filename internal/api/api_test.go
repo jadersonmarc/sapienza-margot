@@ -1,7 +1,9 @@
 package api_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +21,7 @@ import (
 	"github.com/jadersonmarc/sapienza-margot/internal/api"
 	"github.com/jadersonmarc/sapienza-margot/internal/channel"
 	"github.com/jadersonmarc/sapienza-margot/internal/pipeline"
+	"github.com/jadersonmarc/sapienza-margot/internal/secrets"
 	"github.com/jadersonmarc/sapienza-margot/internal/testutil"
 	"github.com/jadersonmarc/sapienza-margot/internal/whatsapp"
 )
@@ -67,7 +70,7 @@ func TestAPIAuthAndIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil, nil)
+	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil, nil, nil, "")
 	h := srv.Handler()
 
 	// No token → 401.
@@ -97,7 +100,7 @@ func TestAPIAuthAndIsolation(t *testing.T) {
 func TestAPIRejectsInvalidToken(t *testing.T) {
 	pool := testutil.Pool(t)
 	testutil.SetupControlPlane(t, pool)
-	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil, nil)
+	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil, nil, nil, "")
 	rec := do(srv.Handler(), "GET", "/api/v1/conversations", "not-a-jwt")
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("invalid token: status %d, want 401", rec.Code)
@@ -110,7 +113,7 @@ func TestAPIRejectsInvalidToken(t *testing.T) {
 func TestChannelOnboarding(t *testing.T) {
 	pool := testutil.Pool(t)
 	testutil.SetupControlPlane(t, pool)
-	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil, nil)
+	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil, nil, nil, "")
 	h := srv.Handler()
 
 	// Tenant assinante SEM canal: provisiona e apaga a linha semeada.
@@ -152,7 +155,7 @@ func TestChannelOnboarding(t *testing.T) {
 func TestChannelDuplicateInstance(t *testing.T) {
 	pool := testutil.Pool(t)
 	testutil.SetupControlPlane(t, pool)
-	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil, nil)
+	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil, nil, nil, "")
 
 	testutil.ProvisionTenant(t, pool, "inst-taken") // tenant A já usa "inst-taken"
 	b := testutil.ProvisionTenant(t, pool, "inst-b")
@@ -167,11 +170,118 @@ func TestChannelDuplicateInstance(t *testing.T) {
 func TestChannelWriteRequiresScope(t *testing.T) {
 	pool := testutil.Pool(t)
 	testutil.SetupControlPlane(t, pool)
-	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil, nil)
+	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil, nil, nil, "")
 	a := testutil.ProvisionTenant(t, pool, "inst-scope")
 	rec := doBody(srv.Handler(), "PUT", "/api/v1/channel", mintRole(t, a, "", "owner"), `{"evolution_instance":"x"}`)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("token sem produto: status %d, want 403", rec.Code)
+	}
+}
+
+// fakeProvisioner finge o Evolution: registra o create e devolve QR/estado
+// controláveis, sem servidor real.
+type fakeProvisioner struct {
+	created   map[string]string // instance → webhook secret
+	qr        string
+	state     string
+	number    string
+	notConfig bool
+}
+
+func (f *fakeProvisioner) Configured() bool { return !f.notConfig }
+func (f *fakeProvisioner) CreateInstance(_ context.Context, name, _, secret string) error {
+	if f.created == nil {
+		f.created = map[string]string{}
+	}
+	f.created[name] = secret
+	return nil
+}
+func (f *fakeProvisioner) ConnectQR(_ context.Context, _ string) (string, error) { return f.qr, nil }
+func (f *fakeProvisioner) State(_ context.Context, _ string) (string, string, error) {
+	return f.state, f.number, nil
+}
+
+func newServerP(t *testing.T, pool *pgxpool.Pool, prov api.ChannelProvisioner) *api.Server {
+	t.Helper()
+	// cipher real (o connect cifra o segredo do webhook). Chave fixa de 32 bytes.
+	key := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
+	ciph, err := secrets.New(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool),
+		whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), ciph, nil, prov, "https://margot.test/webhook/evolution")
+}
+
+// TestConnectChannel: o fluxo self-serve cria a instância no Evolution (com o
+// webhook+secret), grava a linha e devolve o QR; exige owner/admin.
+func TestConnectChannel(t *testing.T) {
+	pool := testutil.Pool(t)
+	testutil.SetupControlPlane(t, pool)
+	a := testutil.ProvisionTenant(t, pool, "seed-x")
+	if _, err := pool.Exec(context.Background(), `DELETE FROM margot.tenant_channels WHERE tenant_id=$1`, a); err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{qr: "data:image/png;base64,QQQ", state: "connecting"}
+	h := newServerP(t, pool, prov).Handler()
+
+	// member não conecta.
+	if rec := doBody(h, "POST", "/api/v1/channel/connect", mintRole(t, a, "margot", "member"), ""); rec.Code != http.StatusForbidden {
+		t.Fatalf("member connect: status %d, want 403", rec.Code)
+	}
+	// owner conecta → 200 com o QR.
+	rec := doBody(h, "POST", "/api/v1/channel/connect", mintRole(t, a, "margot", "owner"), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("owner connect: status %d (body %s), want 200", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		QR string `json:"qr_base64"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	if out.QR != "data:image/png;base64,QQQ" {
+		t.Fatalf("qr = %q", out.QR)
+	}
+	// a instância criada segue o padrão margot-<tenant sem hífen> e recebeu um segredo.
+	name := "margot-" + strings.ReplaceAll(a.String(), "-", "")
+	if prov.created[name] == "" {
+		t.Fatalf("instância %q não foi criada com segredo; created=%v", name, prov.created)
+	}
+	// a linha nasceu com a instância e o driver evolution.
+	var inst, driver string
+	_ = pool.QueryRow(context.Background(),
+		`SELECT evolution_instance, driver FROM margot.tenant_channels WHERE tenant_id=$1`, a).Scan(&inst, &driver)
+	if inst != name || driver != "evolution" {
+		t.Fatalf("linha = (%q,%q), want (%q,evolution)", inst, driver, name)
+	}
+}
+
+// TestChannelStatusOpen: quando o Evolution reporta open, status devolve conectado
+// e grava o número + confirma o dedicado.
+func TestChannelStatusOpen(t *testing.T) {
+	pool := testutil.Pool(t)
+	testutil.SetupControlPlane(t, pool)
+	a := testutil.ProvisionTenant(t, pool, "st-x") // já cria uma linha (seed)
+	prov := &fakeProvisioner{state: "open", number: "5521988887777"}
+	h := newServerP(t, pool, prov).Handler()
+
+	rec := do(h, "GET", "/api/v1/channel/status", mintRole(t, a, "margot", "owner"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: %d (body %s)", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Connected bool   `json:"connected"`
+		State     string `json:"state"`
+		Number    string `json:"number"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	if !out.Connected || out.State != "open" || out.Number != "5521988887777" {
+		t.Fatalf("status out = %+v", out)
+	}
+	var dedicated bool
+	_ = pool.QueryRow(context.Background(),
+		`SELECT dedicated_number_confirmed FROM margot.tenant_channels WHERE tenant_id=$1`, a).Scan(&dedicated)
+	if !dedicated {
+		t.Fatal("conectar deveria marcar dedicated_number_confirmed")
 	}
 }
 

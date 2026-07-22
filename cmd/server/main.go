@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/jadersonmarc/sapienza-kit/authclient"
@@ -69,7 +70,12 @@ func main() {
 	webhook := whatsapp.NewHandler(resolver, pipe, os.Getenv("EVOLUTION_WEBHOOK_SECRET"))
 
 	verifier := authclient.NewVerifier([]byte(mustEnv("PRODUCT_JWT_SECRET")), "sapienza-core")
-	apiServer := api.NewServer(pool, verifier, gate, drivers, cipher, resolver)
+	// Gestão de instância no Evolution (criar/QR/estado) para o onboarding por QR.
+	provisioner := whatsapp.NewManager(os.Getenv("EVOLUTION_API_URL"), os.Getenv("EVOLUTION_API_KEY"))
+	// URL pública que o Evolution vai chamar (a própria Margot). Sem ela, o webhook
+	// não é registrado no create — o onboarding self-serve fica indisponível.
+	webhookURL := strings.TrimRight(os.Getenv("MARGOT_PUBLIC_URL"), "/") + "/webhook/evolution"
+	apiServer := api.NewServer(pool, verifier, gate, drivers, cipher, resolver, provisioner, webhookURL)
 
 	// Provisioning: apply tenant migrations on SubscriptionActivated{margot}.
 	listener := provisioning.New(pool)
