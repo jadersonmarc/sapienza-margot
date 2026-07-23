@@ -157,6 +157,12 @@ func (m *Manager) State(ctx context.Context, name string) (state, number string,
 		return "", "", fmt.Errorf("evolution state: %w", err)
 	}
 	defer resp.Body.Close()
+	// Instância inexistente no Evolution (nunca criada, ou removida no painel): não
+	// é erro — é "desconectado". Assim a tela de configuração mostra o reconectar
+	// (que recria a instância) em vez de ficar presa num 502.
+	if resp.StatusCode == http.StatusNotFound {
+		return "close", "", nil
+	}
 	if resp.StatusCode >= http.StatusMultipleChoices {
 		return "", "", fmt.Errorf("evolution state: status %d: %s", resp.StatusCode, readBodyLimited(resp))
 	}

@@ -100,6 +100,25 @@ func TestManagerCreateAlreadyExists(t *testing.T) {
 	}
 }
 
+func TestManagerStateNotFound(t *testing.T) {
+	// Instância removida no Evolution → 404. State deve tratar como "desconectado"
+	// (close, sem erro), para a tela de configuração oferecer o reconectar.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"status":404,"error":"Not Found","response":{"message":["does not exist"]}}`))
+	}))
+	defer srv.Close()
+
+	m := whatsapp.NewManager(srv.URL, "k")
+	state, number, err := m.State(context.Background(), "margot-removida")
+	if err != nil {
+		t.Fatalf("404 não deve ser erro: %v", err)
+	}
+	if state != "close" || number != "" {
+		t.Fatalf("state=%q number=%q, want close/vazio", state, number)
+	}
+}
+
 func TestManagerNotConfigured(t *testing.T) {
 	if whatsapp.NewManager("", "").Configured() {
 		t.Fatal("sem URL/key deveria ser não-configurado")
