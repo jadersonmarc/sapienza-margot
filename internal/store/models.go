@@ -41,12 +41,12 @@ type Message struct {
 
 // Automation is a per-tenant inbound rule (consumed by internal/automation).
 type Automation struct {
-	ID       uuid.UUID
-	Type     string
-	Trigger  json.RawMessage
-	Action   json.RawMessage
-	Enabled  bool
-	Position int32
+	ID       uuid.UUID       `json:"id"`
+	Type     string          `json:"type"`
+	Trigger  json.RawMessage `json:"trigger"`
+	Action   json.RawMessage `json:"action"`
+	Enabled  bool            `json:"enabled"`
+	Position int32           `json:"position"`
 }
 
 // KBEntry is a knowledge-base document injected into the system prompt.

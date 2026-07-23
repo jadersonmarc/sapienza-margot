@@ -78,6 +78,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /api/v1/contacts/{id}", s.authedManager(s.patchContact))
 	mux.HandleFunc("DELETE /api/v1/contacts/{id}", s.authedManager(s.deleteContact))
 	mux.HandleFunc("GET /api/v1/pipeline", s.authed(s.listPipeline))
+	mux.HandleFunc("GET /api/v1/automations", s.authed(s.listAutomations))
+	mux.HandleFunc("POST /api/v1/automations", s.authedManager(s.createAutomation))
+	mux.HandleFunc("PUT /api/v1/automations/{id}", s.authedManager(s.updateAutomation))
+	mux.HandleFunc("DELETE /api/v1/automations/{id}", s.authedManager(s.deleteAutomation))
 	mux.HandleFunc("GET /api/v1/config", s.authed(s.getConfig))
 	mux.HandleFunc("PUT /api/v1/config", s.authedManager(s.putConfig))
 	mux.HandleFunc("GET /api/v1/setup", s.authed(s.getSetup))
@@ -462,6 +466,103 @@ func (s *Server) deleteContact(w http.ResponseWriter, r *http.Request, tenantID 
 	}
 	if err := s.withTenant(r.Context(), tenantID, func(tx pgx.Tx) error {
 		return store.DeleteContact(r.Context(), tx, id)
+	}); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+var automationTypes = map[string]bool{"off_hours": true, "welcome": true, "keyword": true}
+
+type automationReq struct {
+	Type     string          `json:"type"`
+	Trigger  json.RawMessage `json:"trigger"`
+	Action   json.RawMessage `json:"action"`
+	Enabled  bool            `json:"enabled"`
+	Position int32           `json:"position"`
+}
+
+func jsonOrEmpty(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return json.RawMessage("{}")
+	}
+	return raw
+}
+
+func (s *Server) listAutomations(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {
+	var out []store.Automation
+	if err := s.withTenant(r.Context(), tenantID, func(tx pgx.Tx) error {
+		var err error
+		out, err = store.ListAutomations(r.Context(), tx)
+		return err
+	}); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"automations": out})
+}
+
+func (s *Server) createAutomation(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {
+	var body automationReq
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid payload")
+		return
+	}
+	if !automationTypes[body.Type] {
+		writeErr(w, http.StatusBadRequest, "type inválido (off_hours|welcome|keyword)")
+		return
+	}
+	var id uuid.UUID
+	if err := s.withTenant(r.Context(), tenantID, func(tx pgx.Tx) error {
+		var err error
+		id, err = store.CreateAutomation(r.Context(), tx, store.Automation{
+			Type: body.Type, Trigger: jsonOrEmpty(body.Trigger), Action: jsonOrEmpty(body.Action),
+			Enabled: body.Enabled, Position: body.Position,
+		})
+		return err
+	}); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"id": id})
+}
+
+func (s *Server) updateAutomation(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid automation id")
+		return
+	}
+	var body automationReq
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid payload")
+		return
+	}
+	if !automationTypes[body.Type] {
+		writeErr(w, http.StatusBadRequest, "type inválido (off_hours|welcome|keyword)")
+		return
+	}
+	if err := s.withTenant(r.Context(), tenantID, func(tx pgx.Tx) error {
+		return store.UpdateAutomation(r.Context(), tx, store.Automation{
+			ID: id, Type: body.Type, Trigger: jsonOrEmpty(body.Trigger), Action: jsonOrEmpty(body.Action),
+			Enabled: body.Enabled, Position: body.Position,
+		})
+	}); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) deleteAutomation(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid automation id")
+		return
+	}
+	if err := s.withTenant(r.Context(), tenantID, func(tx pgx.Tx) error {
+		return store.DeleteAutomation(r.Context(), tx, id)
 	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

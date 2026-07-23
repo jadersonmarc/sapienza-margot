@@ -352,6 +352,79 @@ func TestContactsCRM(t *testing.T) {
 	}
 }
 
+type autoDTO struct {
+	ID      string `json:"id"`
+	Type    string `json:"type"`
+	Enabled bool   `json:"enabled"`
+}
+
+func decodeAutomations(t *testing.T, rec *httptest.ResponseRecorder) []autoDTO {
+	t.Helper()
+	var body struct {
+		Automations []autoDTO `json:"automations"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode automations: %v (%s)", err, rec.Body.String())
+	}
+	return body.Automations
+}
+
+func TestAutomationsCRUD(t *testing.T) {
+	pool := testutil.Pool(t)
+	testutil.SetupControlPlane(t, pool)
+
+	tn := testutil.ProvisionTenant(t, pool, "inst-auto")
+	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil, nil, nil, "")
+	h := srv.Handler()
+	owner := mintRole(t, tn, "margot", "owner")
+
+	// Cria uma regra de keyword.
+	create := `{"type":"keyword","trigger":{"keywords":["preço"]},"action":{"reply":"Segue a tabela"},"enabled":true,"position":1}`
+	rec := doBody(h, "POST", "/api/v1/automations", owner, create)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status %d: %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &created)
+
+	// Lista → 1.
+	got := decodeAutomations(t, do(h, "GET", "/api/v1/automations", owner))
+	if len(got) != 1 || got[0].Type != "keyword" || !got[0].Enabled {
+		t.Fatalf("automations = %+v", got)
+	}
+
+	// Atualiza (desabilita).
+	upd := `{"type":"keyword","trigger":{"keywords":["preço","valor"]},"action":{"reply":"x"},"enabled":false,"position":1}`
+	if rec := doBody(h, "PUT", "/api/v1/automations/"+created.ID, owner, upd); rec.Code != http.StatusOK {
+		t.Fatalf("update status %d: %s", rec.Code, rec.Body.String())
+	}
+	got = decodeAutomations(t, do(h, "GET", "/api/v1/automations", owner))
+	if got[0].Enabled {
+		t.Fatalf("após update deveria estar desabilitada: %+v", got[0])
+	}
+
+	// type inválido → 400.
+	if rec := doBody(h, "POST", "/api/v1/automations", owner, `{"type":"xpto"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("type inválido status %d", rec.Code)
+	}
+
+	// member (não-manager) não cria → 403.
+	member := mintRole(t, tn, "margot", "member")
+	if rec := doBody(h, "POST", "/api/v1/automations", member, create); rec.Code != http.StatusForbidden {
+		t.Fatalf("member create status %d, want 403", rec.Code)
+	}
+
+	// Exclui → vazio.
+	if rec := doBody(h, "DELETE", "/api/v1/automations/"+created.ID, owner, ""); rec.Code != http.StatusOK {
+		t.Fatalf("delete status %d", rec.Code)
+	}
+	if got = decodeAutomations(t, do(h, "GET", "/api/v1/automations", owner)); len(got) != 0 {
+		t.Fatalf("após delete = %+v, want vazio", got)
+	}
+}
+
 func do(h http.Handler, method, path, token string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, nil)
 	if token != "" {

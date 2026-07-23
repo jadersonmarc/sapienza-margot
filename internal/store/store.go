@@ -183,6 +183,40 @@ func ListAutomations(ctx context.Context, tx DBTX) ([]Automation, error) {
 	return out, rows.Err()
 }
 
+// CreateAutomation inserts an automation rule and returns its id.
+func CreateAutomation(ctx context.Context, tx DBTX, a Automation) (uuid.UUID, error) {
+	var id uuid.UUID
+	err := tx.QueryRow(ctx, `
+		INSERT INTO automations (type, trigger, action, enabled, position)
+		VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+		a.Type, a.Trigger, a.Action, a.Enabled, a.Position).Scan(&id)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("create automation: %w", err)
+	}
+	return id, nil
+}
+
+// UpdateAutomation edits an automation rule in place.
+func UpdateAutomation(ctx context.Context, tx DBTX, a Automation) error {
+	_, err := tx.Exec(ctx, `
+		UPDATE automations
+		   SET type = $2, trigger = $3, action = $4, enabled = $5, position = $6, updated_at = now()
+		 WHERE id = $1`, a.ID, a.Type, a.Trigger, a.Action, a.Enabled, a.Position)
+	if err != nil {
+		return fmt.Errorf("update automation: %w", err)
+	}
+	return nil
+}
+
+// DeleteAutomation removes an automation rule.
+func DeleteAutomation(ctx context.Context, tx DBTX, id uuid.UUID) error {
+	_, err := tx.Exec(ctx, `DELETE FROM automations WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("delete automation: %w", err)
+	}
+	return nil
+}
+
 // ListConversations returns the tenant's conversations joined with contacts,
 // most recently active first.
 func ListConversations(ctx context.Context, tx DBTX, limit int) ([]ConversationView, error) {
