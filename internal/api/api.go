@@ -74,6 +74,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/conversations/{id}/messages", s.authed(s.listMessages))
 	mux.HandleFunc("POST /api/v1/conversations/{id}/send", s.authed(s.sendMessage))
 	mux.HandleFunc("POST /api/v1/conversations/{id}/handoff", s.authed(s.handoff))
+	mux.HandleFunc("GET /api/v1/contacts", s.authed(s.listContacts))
+	mux.HandleFunc("PATCH /api/v1/contacts/{id}", s.authedManager(s.patchContact))
+	mux.HandleFunc("DELETE /api/v1/contacts/{id}", s.authedManager(s.deleteContact))
+	mux.HandleFunc("GET /api/v1/pipeline", s.authed(s.listPipeline))
 	mux.HandleFunc("GET /api/v1/config", s.authed(s.getConfig))
 	mux.HandleFunc("PUT /api/v1/config", s.authedManager(s.putConfig))
 	mux.HandleFunc("GET /api/v1/setup", s.authed(s.getSetup))
@@ -378,6 +382,91 @@ func (s *Server) handoff(w http.ResponseWriter, r *http.Request, tenantID uuid.U
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mode": mode})
+}
+
+func (s *Server) listContacts(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {
+	var stagePtr *uuid.UUID
+	if sid := r.URL.Query().Get("stage_id"); sid != "" {
+		id, err := uuid.Parse(sid)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "stage_id inválido")
+			return
+		}
+		stagePtr = &id
+	}
+	var out []store.ContactView
+	if err := s.withTenant(r.Context(), tenantID, func(tx pgx.Tx) error {
+		var err error
+		out, err = store.ListContacts(r.Context(), tx, stagePtr, 200)
+		return err
+	}); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"contacts": out})
+}
+
+func (s *Server) listPipeline(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {
+	var out []store.StageView
+	if err := s.withTenant(r.Context(), tenantID, func(tx pgx.Tx) error {
+		var err error
+		out, err = store.ListPipelineStages(r.Context(), tx)
+		return err
+	}); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"stages": out})
+}
+
+type contactPatchReq struct {
+	Name    *string `json:"name"`
+	StageID *string `json:"stage_id"`
+	Consent bool    `json:"consent"`
+}
+
+func (s *Server) patchContact(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid contact id")
+		return
+	}
+	var body contactPatchReq
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid payload")
+		return
+	}
+	var stage uuid.NullUUID
+	if body.StageID != nil && *body.StageID != "" {
+		sid, err := uuid.Parse(*body.StageID)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "stage_id inválido")
+			return
+		}
+		stage = uuid.NullUUID{UUID: sid, Valid: true}
+	}
+	if err := s.withTenant(r.Context(), tenantID, func(tx pgx.Tx) error {
+		return store.UpdateContact(r.Context(), tx, id, body.Name, stage, body.Consent)
+	}); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) deleteContact(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid contact id")
+		return
+	}
+	if err := s.withTenant(r.Context(), tenantID, func(tx pgx.Tx) error {
+		return store.DeleteContact(r.Context(), tx, id)
+	}); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 type channelDTO struct {

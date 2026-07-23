@@ -66,3 +66,21 @@ type ConversationView struct {
 	Status        string     `json:"status"`
 	LastMessageAt *time.Time `json:"last_message_at"`
 }
+
+// ContactView is the CRM/funnel row (leads e clientes do tenant).
+type ContactView struct {
+	ID      uuid.UUID  `json:"id"`
+	Phone   string     `json:"phone"`
+	Name    *string    `json:"name"`
+	Source  string     `json:"source"`
+	StageID *uuid.UUID `json:"stage_id"`
+	Consent bool       `json:"consent"`
+}
+
+// StageView is a funnel stage with the count of contacts in it.
+type StageView struct {
+	ID       uuid.UUID `json:"id"`
+	Name     string    `json:"name"`
+	Position int       `json:"position"`
+	Count    int       `json:"count"`
+}

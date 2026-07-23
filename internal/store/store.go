@@ -207,6 +207,81 @@ func ListConversations(ctx context.Context, tx DBTX, limit int) ([]ConversationV
 	return out, rows.Err()
 }
 
+// ListContacts returns leads/customers of the tenant, optionally filtered by stage.
+func ListContacts(ctx context.Context, tx DBTX, stageID *uuid.UUID, limit int) ([]ContactView, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT id, phone, name, source, stage_id, consent
+		  FROM contacts
+		 WHERE ($1::uuid IS NULL OR stage_id = $1)
+		 ORDER BY updated_at DESC
+		 LIMIT $2`, stageID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list contacts: %w", err)
+	}
+	defer rows.Close()
+	var out []ContactView
+	for rows.Next() {
+		var v ContactView
+		var stage uuid.NullUUID
+		if err := rows.Scan(&v.ID, &v.Phone, &v.Name, &v.Source, &stage, &v.Consent); err != nil {
+			return nil, err
+		}
+		if stage.Valid {
+			id := stage.UUID
+			v.StageID = &id
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// ListPipelineStages returns the funnel stages with the count of contacts in each.
+func ListPipelineStages(ctx context.Context, tx DBTX) ([]StageView, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT s.id, s.name, s.position, COUNT(c.id)
+		  FROM pipeline_stages s
+		  LEFT JOIN contacts c ON c.stage_id = s.id
+		 GROUP BY s.id, s.name, s.position
+		 ORDER BY s.position, s.name`)
+	if err != nil {
+		return nil, fmt.Errorf("list pipeline stages: %w", err)
+	}
+	defer rows.Close()
+	var out []StageView
+	for rows.Next() {
+		var v StageView
+		if err := rows.Scan(&v.ID, &v.Name, &v.Position, &v.Count); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// UpdateContact edits a lead's name, funnel stage and consent (consent_at is set
+// on the first opt-in). Scoped to the tenant by the caller's WithTenant.
+func UpdateContact(ctx context.Context, tx DBTX, id uuid.UUID, name *string, stageID uuid.NullUUID, consent bool) error {
+	_, err := tx.Exec(ctx, `
+		UPDATE contacts
+		   SET name = $2, stage_id = $3, consent = $4,
+		       consent_at = CASE WHEN $4 THEN COALESCE(consent_at, now()) ELSE consent_at END,
+		       updated_at = now()
+		 WHERE id = $1`, id, name, stageID, consent)
+	if err != nil {
+		return fmt.Errorf("update contact: %w", err)
+	}
+	return nil
+}
+
+// DeleteContact removes a lead and cascades to its conversations/messages (LGPD).
+func DeleteContact(ctx context.Context, tx DBTX, id uuid.UUID) error {
+	_, err := tx.Exec(ctx, `DELETE FROM contacts WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("delete contact: %w", err)
+	}
+	return nil
+}
+
 // SearchKnowledge returns up to `limit` KB entries matching the query text
 // (simple case-insensitive match on title/content/tags). This is the "injeção
 // simples" KB — pgvector semantic retrieval is a fast-follow.

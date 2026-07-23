@@ -287,6 +287,71 @@ func TestChannelStatusOpen(t *testing.T) {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+type contactDTO struct {
+	ID      string  `json:"id"`
+	Phone   string  `json:"phone"`
+	Name    *string `json:"name"`
+	Consent bool    `json:"consent"`
+}
+
+func decodeContacts(t *testing.T, rec *httptest.ResponseRecorder) []contactDTO {
+	t.Helper()
+	var body struct {
+		Contacts []contactDTO `json:"contacts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode contacts: %v (%s)", err, rec.Body.String())
+	}
+	return body.Contacts
+}
+
+func TestContactsCRM(t *testing.T) {
+	pool := testutil.Pool(t)
+	testutil.SetupControlPlane(t, pool)
+	ctx := context.Background()
+
+	tn := testutil.ProvisionTenant(t, pool, "inst-crm")
+	// Um inbound cria o contato (via pipeline, fallback sem LLM).
+	p := pipeline.New(pool, whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil, gating.New(pool))
+	ch, _ := resolve(t, pool, "inst-crm")
+	if err := p.Process(ctx, ch, whatsapp.Inbound{Instance: "inst-crm", Phone: "5599", Text: "oi", PushName: "Zé"}); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil, nil, nil, "")
+	h := srv.Handler()
+	owner := mintRole(t, tn, "margot", "owner")
+
+	// Lista contatos → 1.
+	got := decodeContacts(t, do(h, "GET", "/api/v1/contacts", owner))
+	if len(got) != 1 || got[0].Phone != "5599" {
+		t.Fatalf("contacts = %+v, want 1 com phone 5599", got)
+	}
+	id := got[0].ID
+
+	// Pipeline → 200.
+	if rec := do(h, "GET", "/api/v1/pipeline", owner); rec.Code != http.StatusOK {
+		t.Fatalf("pipeline status %d", rec.Code)
+	}
+
+	// PATCH nome + consent → 200 e persiste.
+	if rec := doBody(h, "PATCH", "/api/v1/contacts/"+id, owner, `{"name":"Novo Nome","consent":true}`); rec.Code != http.StatusOK {
+		t.Fatalf("patch status %d: %s", rec.Code, rec.Body.String())
+	}
+	got = decodeContacts(t, do(h, "GET", "/api/v1/contacts", owner))
+	if got[0].Name == nil || *got[0].Name != "Novo Nome" || !got[0].Consent {
+		t.Fatalf("após patch = %+v", got[0])
+	}
+
+	// DELETE → 200, some (cascata LGPD).
+	if rec := doBody(h, "DELETE", "/api/v1/contacts/"+id, owner, ""); rec.Code != http.StatusOK {
+		t.Fatalf("delete status %d", rec.Code)
+	}
+	if got = decodeContacts(t, do(h, "GET", "/api/v1/contacts", owner)); len(got) != 0 {
+		t.Fatalf("após delete = %+v, want vazio", got)
+	}
+}
+
 func do(h http.Handler, method, path, token string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, nil)
 	if token != "" {
