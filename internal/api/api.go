@@ -352,16 +352,32 @@ func (s *Server) handoff(w http.ResponseWriter, r *http.Request, tenantID uuid.U
 		writeErr(w, http.StatusBadRequest, "invalid conversation id")
 		return
 	}
+	// Corpo opcional {"mode":"bot"|"human"}. Default "human" (assumir). "bot"
+	// devolve a conversa ao atendimento automático.
+	var body struct {
+		Mode string `json:"mode"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	mode := body.Mode
+	if mode == "" {
+		mode = "human"
+	}
+	if mode != "human" && mode != "bot" {
+		writeErr(w, http.StatusBadRequest, "mode inválido (use bot ou human)")
+		return
+	}
 	if err := s.withTenant(r.Context(), tenantID, func(tx pgx.Tx) error {
-		if err := store.InsertHandoff(r.Context(), tx, convID, "manual"); err != nil {
-			return err
+		if mode == "human" {
+			if err := store.InsertHandoff(r.Context(), tx, convID, "manual"); err != nil {
+				return err
+			}
 		}
-		return store.SetConversationMode(r.Context(), tx, convID, "human")
+		return store.SetConversationMode(r.Context(), tx, convID, mode)
 	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mode": mode})
 }
 
 type channelDTO struct {
