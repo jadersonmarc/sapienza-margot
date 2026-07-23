@@ -20,6 +20,7 @@ import (
 
 	"github.com/jadersonmarc/sapienza-margot/internal/api"
 	"github.com/jadersonmarc/sapienza-margot/internal/channel"
+	"github.com/jadersonmarc/sapienza-margot/internal/agent"
 	"github.com/jadersonmarc/sapienza-margot/internal/pipeline"
 	"github.com/jadersonmarc/sapienza-margot/internal/secrets"
 	"github.com/jadersonmarc/sapienza-margot/internal/testutil"
@@ -425,6 +426,54 @@ func TestAutomationsCRUD(t *testing.T) {
 	}
 }
 
+type fakeReplier struct{}
+
+func (fakeReplier) Reply(_ context.Context, _, _ string, _ []agent.Turn, _ int) (string, error) {
+	return "Sugestão: nosso preço começa em X.", nil
+}
+
+func TestSuggest(t *testing.T) {
+	pool := testutil.Pool(t)
+	testutil.SetupControlPlane(t, pool)
+	ctx := context.Background()
+
+	tn := testutil.ProvisionTenant(t, pool, "inst-sug")
+	p := pipeline.New(pool, whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil, gating.New(pool))
+	ch, _ := resolve(t, pool, "inst-sug")
+	if err := p.Process(ctx, ch, whatsapp.Inbound{Instance: "inst-sug", Phone: "5511", Text: "quero saber o preço"}); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil, nil, nil, "")
+	srv.SetReplier(fakeReplier{})
+	h := srv.Handler()
+	owner := mintRole(t, tn, "margot", "owner")
+
+	convs := decodeConversations(t, do(h, "GET", "/api/v1/conversations", owner))
+	if len(convs) != 1 || convs[0].ID == "" {
+		t.Fatalf("convs = %+v", convs)
+	}
+	id := convs[0].ID
+
+	rec := doBody(h, "POST", "/api/v1/conversations/"+id+"/suggest", owner, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("suggest status %d: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Suggestion string `json:"suggestion"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	if out.Suggestion == "" {
+		t.Fatalf("sugestão vazia")
+	}
+
+	// Sem Replier ligado → 503.
+	srv2 := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil, nil, nil, "")
+	if rec := doBody(srv2.Handler(), "POST", "/api/v1/conversations/"+id+"/suggest", owner, ""); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("sem replier status %d, want 503", rec.Code)
+	}
+}
+
 func do(h http.Handler, method, path, token string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, nil)
 	if token != "" {
@@ -469,6 +518,7 @@ func mintRole(t *testing.T, tid uuid.UUID, produto, role string) string {
 }
 
 type convDTO struct {
+	ID           string `json:"id"`
 	ContactPhone string `json:"contact_phone"`
 }
 

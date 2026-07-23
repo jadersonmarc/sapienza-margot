@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/jadersonmarc/sapienza-kit/gating"
 	"github.com/jadersonmarc/sapienza-kit/tenancy"
 
+	"github.com/jadersonmarc/sapienza-margot/internal/agent"
 	"github.com/jadersonmarc/sapienza-margot/internal/secrets"
 	"github.com/jadersonmarc/sapienza-margot/internal/store"
 	"github.com/jadersonmarc/sapienza-margot/internal/whatsapp"
@@ -57,7 +59,13 @@ type Server struct {
 	cache       Invalidator        // may be nil (tests that don't resolve channels)
 	provisioner ChannelProvisioner // may be nil (tests that don't provision)
 	webhookURL  string             // public URL Evolution posts to (…/webhook/evolution)
+	replier     agent.Replier      // may be nil (sem ANTHROPIC_API_KEY → sugestão indisponível)
 }
+
+// SetReplier liga o gerador de IA usado pela sugestão de resposta (POST
+// /conversations/{id}/suggest). Injetado no main após NewServer para não mudar a
+// assinatura do construtor (e os call sites dos testes).
+func (s *Server) SetReplier(r agent.Replier) { s.replier = r }
 
 // NewServer builds the API server.
 func NewServer(pool *pgxpool.Pool, verifier *authclient.Verifier, gate *gating.Client, drivers *whatsapp.Registry, cipher *secrets.Cipher, cache Invalidator, provisioner ChannelProvisioner, webhookURL string) *Server {
@@ -74,6 +82,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/conversations/{id}/messages", s.authed(s.listMessages))
 	mux.HandleFunc("POST /api/v1/conversations/{id}/send", s.authed(s.sendMessage))
 	mux.HandleFunc("POST /api/v1/conversations/{id}/handoff", s.authed(s.handoff))
+	mux.HandleFunc("POST /api/v1/conversations/{id}/suggest", s.authed(s.suggest))
 	mux.HandleFunc("GET /api/v1/contacts", s.authed(s.listContacts))
 	mux.HandleFunc("PATCH /api/v1/contacts/{id}", s.authedManager(s.patchContact))
 	mux.HandleFunc("DELETE /api/v1/contacts/{id}", s.authedManager(s.deleteContact))
@@ -386,6 +395,89 @@ func (s *Server) handoff(w http.ResponseWriter, r *http.Request, tenantID uuid.U
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mode": mode})
+}
+
+// suggest gera uma sugestão de resposta para o atendente humano — mesmo prompt do
+// bot (config do agente + injeção de KB), mas apenas devolve o texto (não envia
+// nem fatura). Requer o Replier ligado (SetReplier).
+func (s *Server) suggest(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {
+	if s.replier == nil {
+		writeErr(w, http.StatusServiceUnavailable, "IA não configurada (ANTHROPIC_API_KEY)")
+		return
+	}
+	convID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid conversation id")
+		return
+	}
+	var systemPrompt, aiModel string
+	var maxTokens int
+	err = s.pool.QueryRow(r.Context(),
+		`SELECT system_prompt, ai_model, max_tokens FROM margot.tenant_channels WHERE tenant_id = $1`, tenantID,
+	).Scan(&systemPrompt, &aiModel, &maxTokens)
+	if err == pgx.ErrNoRows {
+		writeErr(w, http.StatusNotFound, "channel not configured")
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var history []store.Message
+	if err := s.withTenant(r.Context(), tenantID, func(tx pgx.Tx) error {
+		var err error
+		if history, err = store.ListRecentMessages(r.Context(), tx, convID, 20); err != nil {
+			return err
+		}
+		// KB injetada a partir da última mensagem do contato (espelha o pipeline).
+		last := ""
+		for i := len(history) - 1; i >= 0; i-- {
+			if history[i].Direction == "in" {
+				last = history[i].Content
+				break
+			}
+		}
+		if last == "" {
+			return nil
+		}
+		kb, err := store.SearchKnowledge(r.Context(), tx, last, 3)
+		if err != nil {
+			return err
+		}
+		if len(kb) > 0 {
+			var b strings.Builder
+			b.WriteString(systemPrompt)
+			b.WriteString("\n\nBase de conhecimento (use quando relevante):\n")
+			for _, e := range kb {
+				fmt.Fprintf(&b, "- %s: %s\n", e.Title, e.Content)
+			}
+			systemPrompt = b.String()
+		}
+		return nil
+	}); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	suggestion, err := s.replier.Reply(r.Context(), aiModel, systemPrompt, apiTurns(history), maxTokens)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"suggestion": suggestion})
+}
+
+func apiTurns(msgs []store.Message) []agent.Turn {
+	turns := make([]agent.Turn, 0, len(msgs))
+	for _, m := range msgs {
+		role := "user"
+		if m.Direction == "out" {
+			role = "assistant"
+		}
+		turns = append(turns, agent.Turn{Role: role, Content: m.Content})
+	}
+	return turns
 }
 
 func (s *Server) listContacts(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {

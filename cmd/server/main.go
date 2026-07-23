@@ -76,6 +76,7 @@ func main() {
 	// não é registrado no create — o onboarding self-serve fica indisponível.
 	webhookURL := strings.TrimRight(os.Getenv("MARGOT_PUBLIC_URL"), "/") + "/webhook/evolution"
 	apiServer := api.NewServer(pool, verifier, gate, drivers, cipher, resolver, provisioner, webhookURL)
+	apiServer.SetReplier(replier) // sugestão de resposta usa o mesmo gerador do bot
 
 	// Provisioning: apply tenant migrations on SubscriptionActivated{margot}.
 	listener := provisioning.New(pool)
