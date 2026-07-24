@@ -344,8 +344,19 @@ func TestContactsCRM(t *testing.T) {
 	id := got[0].ID
 
 	// Pipeline → 200.
-	if rec := do(h, "GET", "/api/v1/pipeline", owner); rec.Code != http.StatusOK {
-		t.Fatalf("pipeline status %d", rec.Code)
+	// Pipeline vem semeado (0004): 5 estágios padrão, "Novo lead" primeiro.
+	precRec := do(h, "GET", "/api/v1/pipeline", owner)
+	if precRec.Code != http.StatusOK {
+		t.Fatalf("pipeline status %d", precRec.Code)
+	}
+	var pl struct {
+		Stages []struct {
+			Name string `json:"name"`
+		} `json:"stages"`
+	}
+	_ = json.Unmarshal(precRec.Body.Bytes(), &pl)
+	if len(pl.Stages) != 5 || pl.Stages[0].Name != "Novo lead" {
+		t.Fatalf("stages semeados = %+v, want 5 começando em 'Novo lead'", pl.Stages)
 	}
 
 	// PATCH nome + consent → 200 e persiste.
