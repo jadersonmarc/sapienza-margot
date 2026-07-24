@@ -119,6 +119,35 @@ func TestManagerStateNotFound(t *testing.T) {
 	}
 }
 
+func TestManagerFindWebhook(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/webhook/find/margot-x" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"url":"https://m/webhook/evolution","enabled":true,"events":["MESSAGES_UPSERT"],"headers":{"apikey":"s"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	m := whatsapp.NewManager(srv.URL, "k")
+	wh, err := m.FindWebhook(context.Background(), "margot-x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wh == nil || wh.URL != "https://m/webhook/evolution" || !wh.Enabled || !wh.HasAPIKey {
+		t.Fatalf("webhook = %+v, want url/enabled/apikey", wh)
+	}
+	if len(wh.Events) != 1 || wh.Events[0] != "MESSAGES_UPSERT" {
+		t.Fatalf("events = %+v", wh.Events)
+	}
+	// Instância sem webhook (404) → nil, nil.
+	wh2, err := m.FindWebhook(context.Background(), "margot-gone")
+	if err != nil || wh2 != nil {
+		t.Fatalf("inexistente: wh=%+v err=%v", wh2, err)
+	}
+}
+
 func TestManagerNotConfigured(t *testing.T) {
 	if whatsapp.NewManager("", "").Configured() {
 		t.Fatal("sem URL/key deveria ser não-configurado")

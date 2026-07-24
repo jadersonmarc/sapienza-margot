@@ -57,12 +57,27 @@ func (m *Manager) do(ctx context.Context, method, path string, body any) (*http.
 	return m.http.Do(req)
 }
 
-// webhook config embedded in the create-instance call (Evolution v2 shape:
-// events are UPPER_SNAKE; the delivered payload uses lowercase "messages.upsert").
+// webhook config (Evolution v2). Eventos em UPPER_SNAKE; o payload entregue usa
+// "messages.upsert". `Enabled` é obrigatório em v2 — sem ele o webhook fica
+// registrado mas inativo (não dispara). ByEvents/Base64 completam o shape.
 type evoWebhook struct {
-	URL     string            `json:"url"`
-	Headers map[string]string `json:"headers,omitempty"`
-	Events  []string          `json:"events"`
+	Enabled  bool              `json:"enabled"`
+	URL      string            `json:"url"`
+	Headers  map[string]string `json:"headers,omitempty"`
+	ByEvents bool              `json:"byEvents"`
+	Base64   bool              `json:"base64"`
+	Events   []string          `json:"events"`
+}
+
+func webhookConfig(webhookURL, secret string) *evoWebhook {
+	return &evoWebhook{
+		Enabled:  true,
+		URL:      webhookURL,
+		Headers:  map[string]string{"apikey": secret},
+		ByEvents: false,
+		Base64:   false,
+		Events:   []string{"MESSAGES_UPSERT"},
+	}
 }
 
 type createInstanceRequest struct {
@@ -81,11 +96,7 @@ func (m *Manager) CreateInstance(ctx context.Context, name, webhookURL, secret s
 		InstanceName: name,
 		Integration:  "WHATSAPP-BAILEYS",
 		QRCode:       true,
-		Webhook: &evoWebhook{
-			URL:     webhookURL,
-			Headers: map[string]string{"apikey": secret},
-			Events:  []string{"MESSAGES_UPSERT"},
-		},
+		Webhook:      webhookConfig(webhookURL, secret),
 	})
 	if err != nil {
 		return fmt.Errorf("evolution create instance: %w", err)
@@ -101,6 +112,66 @@ func (m *Manager) CreateInstance(ctx context.Context, name, webhookURL, secret s
 		return nil
 	}
 	return fmt.Errorf("evolution create instance: status %d: %s", resp.StatusCode, msg)
+}
+
+// SetWebhook (re)configura o webhook da instância explicitamente — garante o
+// webhook ATIVO mesmo quando a versão do Evolution ignora o embutido no create.
+// Idempotente. Evolution v2: POST /webhook/set/{instance} com { "webhook": {...} }.
+func (m *Manager) SetWebhook(ctx context.Context, name, webhookURL, secret string) error {
+	resp, err := m.do(ctx, http.MethodPost, "/webhook/set/"+name, struct {
+		Webhook *evoWebhook `json:"webhook"`
+	}{Webhook: webhookConfig(webhookURL, secret)})
+	if err != nil {
+		return fmt.Errorf("evolution set webhook: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("evolution set webhook: status %d: %s", resp.StatusCode, readBodyLimited(resp))
+	}
+	return nil
+}
+
+// WebhookInfo é a config real do webhook de uma instância (diagnóstico).
+type WebhookInfo struct {
+	URL       string   `json:"url"`
+	Enabled   bool     `json:"enabled"`
+	Events    []string `json:"events"`
+	HasAPIKey bool     `json:"has_apikey"`
+}
+
+// FindWebhook consulta a config real do webhook no Evolution (GET
+// /webhook/find/{instance}). nil,nil se a instância/webhook não existe.
+func (m *Manager) FindWebhook(ctx context.Context, name string) (*WebhookInfo, error) {
+	resp, err := m.do(ctx, http.MethodGet, "/webhook/find/"+name, nil)
+	if err != nil {
+		return nil, fmt.Errorf("evolution find webhook: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("evolution find webhook: status %d: %s", resp.StatusCode, readBodyLimited(resp))
+	}
+	var raw struct {
+		URL     string          `json:"url"`
+		Enabled bool            `json:"enabled"`
+		Events  []string        `json:"events"`
+		Headers json.RawMessage `json:"headers"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, fmt.Errorf("evolution find webhook decode: %w", err)
+	}
+	if raw.URL == "" {
+		return nil, nil
+	}
+	h := string(raw.Headers)
+	return &WebhookInfo{
+		URL:       raw.URL,
+		Enabled:   raw.Enabled,
+		Events:    raw.Events,
+		HasAPIKey: len(raw.Headers) > 0 && h != "null" && h != "{}" && strings.Contains(strings.ToLower(h), "apikey"),
+	}, nil
 }
 
 // qrResponse covers both the create response (qrcode.base64) and the connect

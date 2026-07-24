@@ -45,6 +45,8 @@ type Invalidator interface {
 type ChannelProvisioner interface {
 	Configured() bool
 	CreateInstance(ctx context.Context, name, webhookURL, secret string) error
+	SetWebhook(ctx context.Context, name, webhookURL, secret string) error
+	FindWebhook(ctx context.Context, name string) (*whatsapp.WebhookInfo, error)
 	ConnectQR(ctx context.Context, name string) (string, error)
 	State(ctx context.Context, name string) (state, number string, err error)
 }
@@ -156,6 +158,9 @@ func (s *Server) connectChannel(w http.ResponseWriter, r *http.Request, tenantID
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	// Reforça o webhook explicitamente (algumas versões do Evolution ignoram o
+	// embutido no create). Best-effort: o create já embutiu; o status confirma.
+	_ = s.provisioner.SetWebhook(r.Context(), name, s.webhookURL, secret)
 	if _, err := s.pool.Exec(r.Context(), `
 		INSERT INTO margot.tenant_channels (tenant_id, evolution_instance, driver, webhook_secret_enc)
 		VALUES ($1, $2, 'evolution', $3)
@@ -212,7 +217,15 @@ func (s *Server) channelStatus(w http.ResponseWriter, r *http.Request, tenantID 
 			       dedicated_number_confirmed = true, updated_at = now()
 			 WHERE tenant_id = $1`, tenantID, number)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"connected": connected, "state": state, "number": number})
+	resp := map[string]any{"connected": connected, "state": state, "number": number}
+	// Diagnóstico: config REAL do webhook no Evolution (url + ativo + eventos) — pra
+	// o console confirmar que o webhook está apontando certo e ATIVO.
+	if wh, err := s.provisioner.FindWebhook(r.Context(), instance); err == nil && wh != nil {
+		resp["webhook_url"] = wh.URL
+		resp["webhook_enabled"] = wh.Enabled
+		resp["webhook_events"] = wh.Events
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 type handlerFunc func(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID)

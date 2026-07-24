@@ -18,9 +18,9 @@ import (
 	"github.com/jadersonmarc/sapienza-kit/authclient"
 	"github.com/jadersonmarc/sapienza-kit/gating"
 
+	"github.com/jadersonmarc/sapienza-margot/internal/agent"
 	"github.com/jadersonmarc/sapienza-margot/internal/api"
 	"github.com/jadersonmarc/sapienza-margot/internal/channel"
-	"github.com/jadersonmarc/sapienza-margot/internal/agent"
 	"github.com/jadersonmarc/sapienza-margot/internal/pipeline"
 	"github.com/jadersonmarc/sapienza-margot/internal/secrets"
 	"github.com/jadersonmarc/sapienza-margot/internal/testutil"
@@ -196,6 +196,19 @@ func (f *fakeProvisioner) CreateInstance(_ context.Context, name, _, secret stri
 	}
 	f.created[name] = secret
 	return nil
+}
+func (f *fakeProvisioner) SetWebhook(_ context.Context, name, _, secret string) error {
+	if f.created == nil {
+		f.created = map[string]string{}
+	}
+	f.created[name] = secret
+	return nil
+}
+func (f *fakeProvisioner) FindWebhook(_ context.Context, _ string) (*whatsapp.WebhookInfo, error) {
+	return &whatsapp.WebhookInfo{
+		URL: "http://test/webhook/evolution", Enabled: true,
+		Events: []string{"MESSAGES_UPSERT"}, HasAPIKey: true,
+	}, nil
 }
 func (f *fakeProvisioner) ConnectQR(_ context.Context, _ string) (string, error) { return f.qr, nil }
 func (f *fakeProvisioner) State(_ context.Context, _ string) (string, string, error) {
