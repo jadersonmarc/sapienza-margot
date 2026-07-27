@@ -65,6 +65,7 @@ github.com/jackc/puddle/v2/internal/genstack
 github.com/jadersonmarc/sapienza-kit/authclient
 github.com/jadersonmarc/sapienza-kit/events
 github.com/jadersonmarc/sapienza-kit/gating
+github.com/jadersonmarc/sapienza-kit/period
 github.com/jadersonmarc/sapienza-kit/tenancy
 # github.com/pb33f/ordered-map/v2 v2.3.1
 ## explicit; go 1.24

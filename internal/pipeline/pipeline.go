@@ -18,6 +18,7 @@ import (
 
 	"github.com/jadersonmarc/sapienza-kit/events"
 	"github.com/jadersonmarc/sapienza-kit/gating"
+	"github.com/jadersonmarc/sapienza-kit/period"
 	"github.com/jadersonmarc/sapienza-kit/tenancy"
 
 	"github.com/jadersonmarc/sapienza-margot/internal/agent"
@@ -274,9 +275,9 @@ func (p *Pipeline) sendAndRecord(ctx context.Context, ch channel.TenantChannel, 
 		}
 		// Billable "resposta": one UsageRecorded per AI reply sent, appended to the
 		// platform outbox in the SAME transaction (transactional outbox).
-		period := p.now().UTC().Format("2006-01")
+		per := period.Current(p.now())
 		_, err := events.Publish(ctx, tx, events.TypeUsageRecorded, ch.TenantID, produto, events.UsageRecorded{
-			TenantID: ch.TenantID, Produto: produto, Metric: "resposta", Count: 1, Period: period,
+			TenantID: ch.TenantID, Produto: produto, Metric: "resposta", Count: 1, Period: per,
 		})
 		return err
 	})

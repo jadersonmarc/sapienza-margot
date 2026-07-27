@@ -13,6 +13,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/jadersonmarc/sapienza-kit/period"
 )
 
 // Client reads gating facts from public.
@@ -149,11 +151,11 @@ func (c *Client) CapReached(ctx context.Context, tenantID uuid.UUID, produto, me
 	}
 
 	var count int
-	period := time.Now().UTC().Format("2006-01")
+	per := period.Current(time.Now())
 	err = c.pool.QueryRow(ctx,
 		`SELECT count FROM public.usage_counters
 		  WHERE tenant_id = $1 AND produto = $2 AND period = $3 AND metric = $4`,
-		tenantID, produto, period, metric,
+		tenantID, produto, per, metric,
 	).Scan(&count)
 	switch {
 	case err == pgx.ErrNoRows:
