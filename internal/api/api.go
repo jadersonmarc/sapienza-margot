@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/jadersonmarc/sapienza-kit/authclient"
 	"github.com/jadersonmarc/sapienza-kit/gating"
+	"github.com/jadersonmarc/sapienza-kit/period"
 	"github.com/jadersonmarc/sapienza-kit/tenancy"
 
 	"github.com/jadersonmarc/sapienza-margot/internal/agent"
@@ -96,6 +98,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/config", s.authed(s.getConfig))
 	mux.HandleFunc("PUT /api/v1/config", s.authedManager(s.putConfig))
 	mux.HandleFunc("GET /api/v1/setup", s.authed(s.getSetup))
+	mux.HandleFunc("GET /api/v1/stats", s.authed(s.stats))
 	// Onboarding self-serve (owner/admin): conecta o WhatsApp por QR.
 	mux.HandleFunc("POST /api/v1/channel/connect", s.authedManager(s.connectChannel))
 	mux.HandleFunc("GET /api/v1/channel/status", s.authedManager(s.channelStatus))
@@ -266,6 +269,74 @@ func (s *Server) guard(fn handlerFunc, requireManager bool) http.HandlerFunc {
 		}
 		fn(w, r, claims.TenantID)
 	}
+}
+
+// stats — desempenho da Atendente como série temporal diária (respostas da IA,
+// conversas novas, handoffs) + totais do período (uso vs incluído no plano, taxa
+// de handoff). Mesmo envelope da Editora (period/series/totals; dia São Paulo).
+func (s *Server) stats(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {
+	ctx := r.Context()
+	per := period.Current(time.Now())
+
+	var series []store.StatDay
+	if err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		var err error
+		series, err = store.DailyStats(ctx, tx, per)
+		return err
+	}); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// Uso vs incluído: público, read-only (mesma fonte do gating). Sem plano/uso
+	// no período → 0 (ErrNoRows não é erro aqui).
+	var incluido, uso int
+	sub, err := s.gate.TenantSubscription(ctx, tenantID, produto)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if sub.Subscribed {
+		if err := s.pool.QueryRow(ctx,
+			`SELECT COALESCE(incluso, 0) FROM public.plans WHERE produto = $1 AND tier = $2`,
+			produto, sub.Tier,
+		).Scan(&incluido); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if err := s.pool.QueryRow(ctx,
+			`SELECT COALESCE(count, 0) FROM public.usage_counters
+			  WHERE tenant_id = $1 AND produto = $2 AND period = $3 AND metric = 'resposta'`,
+			tenantID, produto, per,
+		).Scan(&uso); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+
+	var respostas, conversas, handoffs int
+	for _, d := range series {
+		respostas += d.Respostas
+		conversas += d.Conversas
+		handoffs += d.Handoffs
+	}
+	taxa := 0.0
+	if conversas > 0 {
+		taxa = float64(handoffs) / float64(conversas)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"period": per,
+		"series": series,
+		"totals": map[string]any{
+			"uso":          uso,
+			"incluido":     incluido,
+			"respostas":    respostas,
+			"conversas":    conversas,
+			"handoffs":     handoffs,
+			"taxa_handoff": taxa,
+		},
+	})
 }
 
 // withTenant runs fn in a transaction scoped to the tenant's schema.

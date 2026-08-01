@@ -556,3 +556,58 @@ func decodeConversations(t *testing.T, rec *httptest.ResponseRecorder) []convDTO
 	}
 	return out.Conversations
 }
+
+// okReplier devolve uma resposta fixa (para gerar uma mensagem out/bot no seed).
+type okReplier struct{}
+
+func (okReplier) Reply(context.Context, string, string, []agent.Turn, int) (string, error) {
+	return "resposta da IA", nil
+}
+
+// TestStatsEnvelope: /stats devolve a série diária + totais no envelope comum.
+func TestStatsEnvelope(t *testing.T) {
+	pool := testutil.Pool(t)
+	testutil.SetupControlPlane(t, pool)
+	ctx := context.Background()
+	a := testutil.ProvisionTenant(t, pool, "inst-stats")
+
+	// Seed: uma conversa com 1 resposta da IA (out/bot).
+	p := pipeline.New(pool, whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), okReplier{}, gating.New(pool))
+	ch, _ := resolve(t, pool, "inst-stats")
+	if err := p.Process(ctx, ch, whatsapp.Inbound{Instance: "inst-stats", Phone: "111", Text: "oi", ProviderID: "m1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil, nil, nil, "")
+	rec := do(srv.Handler(), "GET", "/api/v1/stats", mint(t, a))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stats: status %d, want 200", rec.Code)
+	}
+
+	var out struct {
+		Period string `json:"period"`
+		Series []struct {
+			Day       string `json:"day"`
+			Respostas int    `json:"respostas"`
+			Conversas int    `json:"conversas"`
+			Handoffs  int    `json:"handoffs"`
+		} `json:"series"`
+		Totals struct {
+			Uso         int     `json:"uso"`
+			Incluido    int     `json:"incluido"`
+			Respostas   int     `json:"respostas"`
+			Conversas   int     `json:"conversas"`
+			Handoffs    int     `json:"handoffs"`
+			TaxaHandoff float64 `json:"taxa_handoff"`
+		} `json:"totals"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Period == "" || len(out.Series) < 1 {
+		t.Fatalf("envelope vazio: %+v", out)
+	}
+	if out.Totals.Respostas != 1 || out.Totals.Conversas != 1 || out.Totals.Handoffs != 0 {
+		t.Fatalf("totais = %+v, want respostas=1 conversas=1 handoffs=0", out.Totals)
+	}
+}
