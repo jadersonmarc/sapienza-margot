@@ -3,6 +3,7 @@ package pipeline_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,14 +13,22 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/jadersonmarc/sapienza-kit/gating"
+	"github.com/jadersonmarc/sapienza-kit/period"
 	"github.com/jadersonmarc/sapienza-kit/tenancy"
 
 	"github.com/jadersonmarc/sapienza-margot/internal/agent"
 	"github.com/jadersonmarc/sapienza-margot/internal/channel"
 	"github.com/jadersonmarc/sapienza-margot/internal/pipeline"
 	"github.com/jadersonmarc/sapienza-margot/internal/testutil"
+	"github.com/jadersonmarc/sapienza-margot/internal/transcribe"
 	"github.com/jadersonmarc/sapienza-margot/internal/whatsapp"
 )
+
+// audioInbound é uma nota de voz (sem texto) — o pipeline deve transcrever ou cair
+// no fallback.
+func audioInbound(instance, phone, id string) whatsapp.Inbound {
+	return whatsapp.Inbound{Instance: instance, Phone: phone, ProviderID: id, IsAudio: true}
+}
 
 type stubReplier struct{ reply string }
 
@@ -123,6 +132,59 @@ func TestTenantIsolation(t *testing.T) {
 	}
 	if len(mock.Messages()) != 2 {
 		t.Fatalf("mock sent %d, want 2", len(mock.Messages()))
+	}
+}
+
+func TestAudioSemSTTCaiNoFallbackNaoFatura(t *testing.T) {
+	pool := testutil.Pool(t)
+	testutil.SetupControlPlane(t, pool)
+	a := testutil.ProvisionTenant(t, pool, "inst-a")
+	ch := resolveChannel(t, pool, "inst-a")
+
+	mock := &whatsapp.MockSender{}
+	// Sem SetTranscriber → Noop (desligado).
+	p := pipeline.New(pool, registry(mock), stubReplier{"resp da IA"}, gating.New(pool))
+	if err := p.Process(context.Background(), ch, audioInbound("inst-a", "111", "aud-1")); err != nil {
+		t.Fatalf("process áudio: %v", err)
+	}
+	// Fallback canned não fatura.
+	if got := usageResposta(t, pool, a); got != 0 {
+		t.Fatalf("usage = %d, want 0 (fallback não fatura)", got)
+	}
+	// Respondeu por texto pedindo para escrever (não a resposta da IA).
+	msgs := mock.Messages()
+	if len(msgs) != 1 || !strings.Contains(msgs[0].Text, "escrever") {
+		t.Fatalf("esperava 1 fallback pedindo texto, veio: %+v", msgs)
+	}
+	// A entrada de áudio foi registrada.
+	if got := tenantCount(t, pool, a, "messages", "WHERE direction='in'"); got != 1 {
+		t.Fatalf("inbound de áudio registrado = %d, want 1", got)
+	}
+}
+
+func TestAudioComSTTTranscreveEFatura(t *testing.T) {
+	pool := testutil.Pool(t)
+	testutil.SetupControlPlane(t, pool)
+	a := testutil.ProvisionTenant(t, pool, "inst-a")
+	ch := resolveChannel(t, pool, "inst-a")
+
+	mock := &whatsapp.MockSender{}
+	p := pipeline.New(pool, registry(mock), stubReplier{"resp da IA"}, gating.New(pool))
+	p.SetTranscriber(transcribe.MockTranscriber{Text: "quero saber o preço"})
+	if err := p.Process(context.Background(), ch, audioInbound("inst-a", "111", "aud-2")); err != nil {
+		t.Fatalf("process áudio: %v", err)
+	}
+	// Transcreveu → gerou resposta de IA → faturou 1.
+	if got := usageResposta(t, pool, a); got != 1 {
+		t.Fatalf("usage = %d, want 1 (transcrição vira texto e a resposta fatura)", got)
+	}
+	msgs := mock.Messages()
+	if len(msgs) != 1 || msgs[0].Text != "resp da IA" {
+		t.Fatalf("esperava a resposta da IA, veio: %+v", msgs)
+	}
+	// A entrada persistida é a transcrição (o humano vê o que foi dito).
+	if got := tenantCount(t, pool, a, "messages", "WHERE direction='in' AND content=$1", "quero saber o preço"); got != 1 {
+		t.Fatalf("transcrição persistida = %d, want 1", got)
 	}
 }
 
@@ -248,10 +310,13 @@ func TestHardCapNaoGeraResposta(t *testing.T) {
 		`UPDATE public.subscriptions SET tier='start', hard_cap=true WHERE tenant_id=$1 AND produto='margot'`, a); err != nil {
 		t.Fatal(err)
 	}
-	period := time.Now().UTC().Format("2006-01")
+	// Mesmo período que o gating consulta: convenção BRT (São Paulo), não UTC —
+	// senão, na virada de dia perto da meia-noite, o mês UTC ≠ mês BRT e o cap não
+	// enxerga o uso inserido.
+	per := period.Current(time.Now())
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO public.usage_counters (tenant_id, produto, period, metric, count)
-		 VALUES ($1,'margot',$2,'resposta',500)`, a, period); err != nil {
+		 VALUES ($1,'margot',$2,'resposta',500)`, a, per); err != nil {
 		t.Fatal(err)
 	}
 
