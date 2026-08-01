@@ -50,6 +50,7 @@ internal/secrets          AES-256-GCM por tenant (formato iv:tag:ciphertext, int
 
 ```
 webhook Evolution → autoriza (apikey) → filtra messages.upsert → resolve tenant pela instância
+  → nota de voz? busca os bytes (via driver) e transcreve (STT) → vira texto e segue
   → persiste inbound (nunca fatura)
   → mode != bot? para aqui
   → gating: assinatura margot ativa? senão, silêncio
@@ -60,6 +61,11 @@ webhook Evolution → autoriza (apikey) → filtra messages.upsert → resolve t
 
 **Faturável = resposta da IA.** A entrada do cliente é grátis; automações e o envio manual do
 humano pelo console também não faturam. Excedente R$ 0,50/resposta; tiers 500/1.500/5.000.
+
+**Áudio (nota de voz):** transcrito via STT compatível com OpenAI (`internal/transcribe`; serve
+OpenAI ou Groq trocando `STT_BASE_URL`/`STT_MODEL`). Sem `STT_API_KEY` fica desligado → o bot
+responde por texto pedindo para escrever (canned, não fatura). A transcrição em si não fatura; só
+a resposta da IA ao texto transcrito. Ver `.env.example`.
 Sem janela de 24h e sem máquina de sessão — isso é da Meta, não do Evolution.
 
 ### Driver de WhatsApp

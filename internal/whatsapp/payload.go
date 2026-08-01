@@ -27,6 +27,9 @@ type evolutionMessage struct {
 	ExtendedTextMessage *struct {
 		Text string `json:"text"`
 	} `json:"extendedTextMessage"`
+	AudioMessage *struct {
+		Mimetype string `json:"mimetype"`
+	} `json:"audioMessage"`
 }
 
 // Inbound is the normalized, actionable view of a webhook event (exported so the
@@ -38,6 +41,7 @@ type Inbound struct {
 	Text       string
 	ProviderID string
 	FromMe     bool
+	IsAudio    bool // nota de voz sem texto — precisa transcrição (ver pipeline)
 }
 
 // parseInbound normalizes a webhook into an Inbound. The bool is false when the
@@ -47,13 +51,15 @@ func parseInbound(w evolutionWebhook) (Inbound, bool) {
 	if !ok {
 		return Inbound{}, false
 	}
+	text := messageText(w.Data.Message)
 	return Inbound{
 		Instance:   w.Instance,
 		Phone:      phone,
 		PushName:   w.Data.PushName,
-		Text:       messageText(w.Data.Message),
+		Text:       text,
 		ProviderID: w.Data.Key.ID,
 		FromMe:     w.Data.Key.FromMe,
+		IsAudio:    text == "" && w.Data.Message.AudioMessage != nil,
 	}, true
 }
 

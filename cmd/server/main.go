@@ -20,6 +20,7 @@ import (
 	"github.com/jadersonmarc/sapienza-margot/internal/pipeline"
 	"github.com/jadersonmarc/sapienza-margot/internal/provisioning"
 	"github.com/jadersonmarc/sapienza-margot/internal/secrets"
+	"github.com/jadersonmarc/sapienza-margot/internal/transcribe"
 	"github.com/jadersonmarc/sapienza-margot/internal/whatsapp"
 )
 
@@ -67,6 +68,7 @@ func main() {
 
 	gate := gating.New(pool)
 	pipe := pipeline.New(pool, drivers, replier, gate)
+	pipe.SetTranscriber(transcribe.New()) // áudio→texto; desligado sem STT_API_KEY (fallback)
 	webhook := whatsapp.NewHandler(resolver, pipe, os.Getenv("EVOLUTION_WEBHOOK_SECRET"))
 
 	verifier := authclient.NewVerifier([]byte(mustEnv("PRODUCT_JWT_SECRET")), "sapienza-core")

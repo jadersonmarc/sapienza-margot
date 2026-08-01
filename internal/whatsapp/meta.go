@@ -26,3 +26,8 @@ func (d *MetaDriver) Name() string { return "meta" }
 func (d *MetaDriver) SendText(_ context.Context, _, _, _ string) (string, error) {
 	return "", errors.New("meta driver not configured")
 }
+
+// MediaBase64 is not implemented yet — Meta driver is a stub.
+func (d *MetaDriver) MediaBase64(_ context.Context, _ string, _ MediaKey) ([]byte, string, error) {
+	return nil, "", errors.New("meta driver not configured")
+}

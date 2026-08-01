@@ -8,6 +8,7 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -25,8 +26,13 @@ import (
 	"github.com/jadersonmarc/sapienza-margot/internal/automation"
 	"github.com/jadersonmarc/sapienza-margot/internal/channel"
 	"github.com/jadersonmarc/sapienza-margot/internal/store"
+	"github.com/jadersonmarc/sapienza-margot/internal/transcribe"
 	"github.com/jadersonmarc/sapienza-margot/internal/whatsapp"
 )
+
+// audioFallback é a resposta (canned, não-faturável) quando não há como transcrever
+// o áudio — sem STT configurado ou falha na transcrição.
+const audioFallback = "Ainda não consigo ouvir áudios — pode me escrever por texto? 🙏"
 
 const (
 	produto           = "margot"
@@ -42,28 +48,52 @@ const eventHandoffTriggered = events.Type("HandoffTriggered")
 
 // Pipeline processes inbound WhatsApp messages for a tenant.
 type Pipeline struct {
-	pool    *pgxpool.Pool
-	drivers *whatsapp.Registry // resolves the tenant's driver (evolution|meta)
-	replier agent.Replier      // nil => reply with the tenant's fallback
-	gate    *gating.Client
-	rules   *rulesCache
-	now     func() time.Time
+	pool        *pgxpool.Pool
+	drivers     *whatsapp.Registry     // resolves the tenant's driver (evolution|meta)
+	replier     agent.Replier          // nil => reply with the tenant's fallback
+	transcriber transcribe.Transcriber // áudio → texto; Noop = desligado (fallback)
+	gate        *gating.Client
+	rules       *rulesCache
+	now         func() time.Time
 }
 
-// New builds a Pipeline. replier may be nil (fallback-only).
+// New builds a Pipeline. replier may be nil (fallback-only). Transcriber começa
+// desligado (Noop) — use SetTranscriber para plugar um provider de STT.
 func New(pool *pgxpool.Pool, drivers *whatsapp.Registry, replier agent.Replier, gate *gating.Client) *Pipeline {
 	return &Pipeline{
-		pool:    pool,
-		drivers: drivers,
-		replier: replier,
-		gate:    gate,
-		rules:   &rulesCache{pool: pool, ttl: 60 * time.Second},
-		now:     time.Now,
+		pool:        pool,
+		drivers:     drivers,
+		replier:     replier,
+		transcriber: transcribe.NoopTranscriber{},
+		gate:        gate,
+		rules:       &rulesCache{pool: pool, ttl: 60 * time.Second},
+		now:         time.Now,
 	}
+}
+
+// SetTranscriber pluga o provider de transcrição de áudio (nil = desligado).
+// Injetado sem mudar o construtor (espelha o padrão do Replier).
+func (p *Pipeline) SetTranscriber(t transcribe.Transcriber) {
+	if t == nil {
+		t = transcribe.NoopTranscriber{}
+	}
+	p.transcriber = t
 }
 
 // Process implements whatsapp.Processor.
 func (p *Pipeline) Process(ctx context.Context, ch channel.TenantChannel, in whatsapp.Inbound) error {
+	// 0) Nota de voz: transcreve para texto e segue o fluxo normal. Sem STT (ou
+	// falha), marca a entrada como áudio e cai num fallback por texto mais adiante.
+	audioNeedsFallback := false
+	if in.IsAudio && in.Text == "" {
+		if text, ok := p.resolveAudioText(ctx, ch, in); ok {
+			in.Text = text
+		} else {
+			in.Text = "[áudio]"
+			audioNeedsFallback = true
+		}
+	}
+
 	// 1) Persist inbound + billing, atomically, scoped to the tenant.
 	conv, isNew, err := p.persistInbound(ctx, ch, in)
 	if err != nil {
@@ -84,6 +114,11 @@ func (p *Pipeline) Process(ctx context.Context, ch channel.TenantChannel, in wha
 		return err
 	} else if !ok {
 		return nil
+	}
+	// Áudio sem transcrição: responde por texto pedindo para escrever. Canned (não
+	// é resposta de IA) → não fatura. Encerra aqui (não gera resposta de IA).
+	if audioNeedsFallback {
+		return p.sendAndRecord(ctx, ch, conv.ID, in.Phone, audioFallback, "bot", false)
 	}
 	// Hard cap reached: record the inbound (already persisted, shows in the console)
 	// but generate nothing — the model call is the cost we are capping.
@@ -225,6 +260,31 @@ func (p *Pipeline) applyAutomation(ctx context.Context, ch channel.TenantChannel
 		})
 	}
 	return nil
+}
+
+// resolveAudioText busca os bytes do áudio (via driver) e transcreve. Devolve
+// (texto, true) no sucesso; ("", false) quando não há STT ou algo falha — o
+// chamador cai no fallback por texto. Best-effort: só loga as falhas.
+func (p *Pipeline) resolveAudioText(ctx context.Context, ch channel.TenantChannel, in whatsapp.Inbound) (string, bool) {
+	if p.transcriber == nil || !p.transcriber.Configured() {
+		return "", false
+	}
+	data, mime, err := p.drivers.For(ch.Driver).MediaBase64(ctx, ch.EvolutionInstance, whatsapp.MediaKey{
+		ID: in.ProviderID, RemoteJid: in.Phone + "@s.whatsapp.net", FromMe: in.FromMe,
+	})
+	if err != nil {
+		log.Printf("[pipeline] falha ao buscar áudio (tenant %s): %v", ch.TenantID, err)
+		return "", false
+	}
+	text, err := p.transcriber.Transcribe(ctx, data, mime)
+	if err != nil {
+		log.Printf("[pipeline] falha ao transcrever áudio (tenant %s): %v", ch.TenantID, err)
+		return "", false
+	}
+	if text = strings.TrimSpace(text); text == "" {
+		return "", false
+	}
+	return text, true
 }
 
 // generateReply builds the system prompt (config + KB injection) and calls the

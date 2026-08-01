@@ -53,7 +53,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	in, ok := parseInbound(payload)
-	if !ok || in.FromMe || in.Text == "" {
+	// Acionável = texto OU nota de voz (o pipeline transcreve o áudio).
+	if !ok || in.FromMe || (in.Text == "" && !in.IsAudio) {
 		w.WriteHeader(http.StatusOK) // not actionable
 		return
 	}
