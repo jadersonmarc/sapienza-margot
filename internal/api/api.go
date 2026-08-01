@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -32,6 +33,9 @@ import (
 )
 
 const produto = "margot"
+
+// periodRe valida o parâmetro ?period= do /stats (AAAA-MM).
+var periodRe = regexp.MustCompile(`^\d{4}-\d{2}$`)
 
 // Invalidator drops a cached channel so a config change takes effect now instead
 // of after the resolver's TTL. Satisfied by *channel.Resolver; an interface keeps
@@ -276,7 +280,11 @@ func (s *Server) guard(fn handlerFunc, requireManager bool) http.HandlerFunc {
 // de handoff). Mesmo envelope da Editora (period/series/totals; dia São Paulo).
 func (s *Server) stats(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {
 	ctx := r.Context()
+	// Período opcional (AAAA-MM) — permite comparar meses; default = corrente.
 	per := period.Current(time.Now())
+	if q := r.URL.Query().Get("period"); periodRe.MatchString(q) {
+		per = q
+	}
 
 	var series []store.StatDay
 	if err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
