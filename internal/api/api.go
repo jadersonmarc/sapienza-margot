@@ -306,7 +306,8 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request, tenantID uuid.UUI
 	}
 	if sub.Subscribed {
 		if err := s.pool.QueryRow(ctx,
-			`SELECT COALESCE(incluso, 0) FROM public.plans WHERE produto = $1 AND tier = $2`,
+			// plans tem 1 linha por modelo (anual/mensal); `incluso` é idêntico -> LIMIT 1.
+			`SELECT COALESCE(incluso, 0) FROM public.plans WHERE produto = $1 AND tier = $2 LIMIT 1`,
 			produto, sub.Tier,
 		).Scan(&incluido); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			writeErr(w, http.StatusInternalServerError, err.Error())
