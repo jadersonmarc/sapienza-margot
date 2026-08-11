@@ -32,6 +32,7 @@ type TenantChannel struct {
 	Fallback                 string
 	MaxTokens                int32
 	AIModel                  string
+	HandoffMax               int32 // handoff por volume na sessão; 0 = nunca automático
 }
 
 // Loader reads a channel from Postgres.
@@ -53,12 +54,12 @@ func (l *Loader) ByInstance(ctx context.Context, instance string) (TenantChannel
 		SELECT tenant_id, evolution_instance, COALESCE(whatsapp_number, ''),
 		       driver, dedicated_number_confirmed,
 		       api_url, api_key_enc, webhook_secret_enc,
-		       system_prompt, tone, fallback, max_tokens, ai_model
+		       system_prompt, tone, fallback, max_tokens, ai_model, handoff_max
 		  FROM margot.tenant_channels WHERE evolution_instance = $1`, instance,
 	).Scan(&c.TenantID, &c.EvolutionInstance, &c.WhatsappNumber,
 		&c.Driver, &c.DedicatedNumberConfirmed,
 		&apiURL, &apiKeyEnc, &webhookSecretEnc,
-		&c.SystemPrompt, &c.Tone, &c.Fallback, &c.MaxTokens, &c.AIModel)
+		&c.SystemPrompt, &c.Tone, &c.Fallback, &c.MaxTokens, &c.AIModel, &c.HandoffMax)
 	if err == pgx.ErrNoRows {
 		return TenantChannel{}, fmt.Errorf("no channel for instance %q", instance)
 	}

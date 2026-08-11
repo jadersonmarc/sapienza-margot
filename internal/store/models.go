@@ -59,12 +59,14 @@ type KBEntry struct {
 
 // ConversationView is a conversation joined with its contact, for the API list.
 type ConversationView struct {
-	ID            uuid.UUID  `json:"id"`
-	ContactPhone  string     `json:"contact_phone"`
-	ContactName   *string    `json:"contact_name"`
-	Mode          string     `json:"mode"`
-	Status        string     `json:"status"`
-	LastMessageAt *time.Time `json:"last_message_at"`
+	ID              uuid.UUID  `json:"id"`
+	ContactPhone    string     `json:"contact_phone"`
+	ContactName     *string    `json:"contact_name"`
+	Mode            string     `json:"mode"`
+	Status          string     `json:"status"`
+	NeedsAttention  bool       `json:"needs_attention"`
+	AttentionReason string     `json:"attention_reason"`
+	LastMessageAt   *time.Time `json:"last_message_at"`
 }
 
 // ContactView is the CRM/funnel row (leads e clientes do tenant).
