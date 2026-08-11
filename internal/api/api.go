@@ -91,6 +91,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/conversations/{id}/send", s.authed(s.sendMessage))
 	mux.HandleFunc("POST /api/v1/conversations/{id}/handoff", s.authed(s.handoff))
 	mux.HandleFunc("POST /api/v1/conversations/{id}/suggest", s.authed(s.suggest))
+	mux.HandleFunc("POST /api/v1/conversations/{id}/clear", s.authedManager(s.clearConversation))
+	mux.HandleFunc("DELETE /api/v1/conversations/{id}", s.authedManager(s.deleteConversation))
 	mux.HandleFunc("GET /api/v1/contacts", s.authed(s.listContacts))
 	mux.HandleFunc("PATCH /api/v1/contacts/{id}", s.authedManager(s.patchContact))
 	mux.HandleFunc("DELETE /api/v1/contacts/{id}", s.authedManager(s.deleteContact))
@@ -490,6 +492,41 @@ func (s *Server) handoff(w http.ResponseWriter, r *http.Request, tenantID uuid.U
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mode": mode})
 }
 
+// clearConversation apaga o histórico de mensagens da conversa (mantém o
+// lead/contato) e a reinicia como uma sessão nova do bot. Resolve o caso de
+// limpar no WhatsApp mas o console seguir com o histórico antigo confundindo a IA.
+func (s *Server) clearConversation(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {
+	convID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid conversation id")
+		return
+	}
+	if err := s.withTenant(r.Context(), tenantID, func(tx pgx.Tx) error {
+		return store.ClearConversation(r.Context(), tx, convID)
+	}); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// deleteConversation remove a conversa inteira (mensagens e handoffs via cascade).
+// O contato/lead permanece no CRM.
+func (s *Server) deleteConversation(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID) {
+	convID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid conversation id")
+		return
+	}
+	if err := s.withTenant(r.Context(), tenantID, func(tx pgx.Tx) error {
+		return store.DeleteConversation(r.Context(), tx, convID)
+	}); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 // suggest gera uma sugestão de resposta para o atendente humano — mesmo prompt do
 // bot (config do agente + injeção de KB), mas apenas devolve o texto (não envia
 // nem fatura). Requer o Replier ligado (SetReplier).
@@ -819,6 +856,7 @@ type configDTO struct {
 	Fallback                 string `json:"fallback"`
 	MaxTokens                int32  `json:"max_tokens"`
 	AIModel                  string `json:"ai_model"`
+	HandoffMax               int32  `json:"handoff_max"`                // passar p/ humano após N msgs da sessão; 0 = nunca
 	Driver                   string `json:"driver"`                     // "evolution" | "meta"
 	DedicatedNumberConfirmed bool   `json:"dedicated_number_confirmed"` // onboarding requirement
 }
@@ -827,10 +865,10 @@ func (s *Server) getConfig(w http.ResponseWriter, r *http.Request, tenantID uuid
 	var c configDTO
 	err := s.pool.QueryRow(r.Context(),
 		`SELECT COALESCE(evolution_instance, ''), COALESCE(whatsapp_number, ''),
-		        system_prompt, tone, fallback, max_tokens, ai_model, driver, dedicated_number_confirmed
+		        system_prompt, tone, fallback, max_tokens, ai_model, handoff_max, driver, dedicated_number_confirmed
 		   FROM margot.tenant_channels WHERE tenant_id = $1`, tenantID,
 	).Scan(&c.EvolutionInstance, &c.WhatsappNumber,
-		&c.SystemPrompt, &c.Tone, &c.Fallback, &c.MaxTokens, &c.AIModel, &c.Driver, &c.DedicatedNumberConfirmed)
+		&c.SystemPrompt, &c.Tone, &c.Fallback, &c.MaxTokens, &c.AIModel, &c.HandoffMax, &c.Driver, &c.DedicatedNumberConfirmed)
 	if err == pgx.ErrNoRows {
 		writeErr(w, http.StatusNotFound, "channel not configured")
 		return
@@ -898,12 +936,16 @@ func (s *Server) putConfig(w http.ResponseWriter, r *http.Request, tenantID uuid
 		writeErr(w, http.StatusBadRequest, "invalid body")
 		return
 	}
+	handoffMax := c.HandoffMax
+	if handoffMax < 0 {
+		handoffMax = 0
+	}
 	tag, err := s.pool.Exec(r.Context(), `
 		UPDATE margot.tenant_channels
 		   SET system_prompt = $2, tone = $3, fallback = $4, max_tokens = $5, ai_model = $6,
-		       updated_at = now()
+		       handoff_max = $7, updated_at = now()
 		 WHERE tenant_id = $1`,
-		tenantID, c.SystemPrompt, c.Tone, c.Fallback, c.MaxTokens, c.AIModel)
+		tenantID, c.SystemPrompt, c.Tone, c.Fallback, c.MaxTokens, c.AIModel, handoffMax)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

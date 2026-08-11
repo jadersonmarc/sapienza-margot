@@ -98,6 +98,57 @@ func TestAPIAuthAndIsolation(t *testing.T) {
 	}
 }
 
+// TestConversationClearAndDelete: limpar zera as mensagens mas mantém a conversa
+// (e o lead); apagar remove a conversa. Ambos exigem owner/admin.
+func TestConversationClearAndDelete(t *testing.T) {
+	pool := testutil.Pool(t)
+	testutil.SetupControlPlane(t, pool)
+	ctx := context.Background()
+	a := testutil.ProvisionTenant(t, pool, "inst-a")
+
+	p := pipeline.New(pool, whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil, gating.New(pool))
+	chA, _ := resolve(t, pool, "inst-a")
+	if err := p.Process(ctx, chA, whatsapp.Inbound{Instance: "inst-a", Phone: "111", Text: "oi"}); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := api.NewServer(pool, authclient.NewVerifier(secret, "sapienza-core"), gating.New(pool), whatsapp.NewRegistry("evolution", &whatsapp.MockSender{}), nil, nil, nil, "")
+	h := srv.Handler()
+
+	convs := decodeConversations(t, do(h, "GET", "/api/v1/conversations", mint(t, a)))
+	if len(convs) != 1 {
+		t.Fatalf("setup: esperava 1 conversa, got %d", len(convs))
+	}
+	id := convs[0].ID
+
+	// member não pode limpar nem apagar.
+	if rec := do(h, "POST", "/api/v1/conversations/"+id+"/clear", mintRole(t, a, "margot", "member")); rec.Code != http.StatusForbidden {
+		t.Fatalf("member clear: status %d, want 403", rec.Code)
+	}
+	if rec := do(h, "DELETE", "/api/v1/conversations/"+id, mintRole(t, a, "margot", "member")); rec.Code != http.StatusForbidden {
+		t.Fatalf("member delete: status %d, want 403", rec.Code)
+	}
+
+	// owner limpa: mensagens somem, conversa permanece.
+	if rec := do(h, "POST", "/api/v1/conversations/"+id+"/clear", mintRole(t, a, "margot", "owner")); rec.Code != http.StatusOK {
+		t.Fatalf("owner clear: status %d (body %s), want 200", rec.Code, rec.Body.String())
+	}
+	if got := decodeMessages(t, do(h, "GET", "/api/v1/conversations/"+id+"/messages", mint(t, a))); len(got) != 0 {
+		t.Fatalf("após limpar: esperava 0 mensagens, got %d", len(got))
+	}
+	if convs := decodeConversations(t, do(h, "GET", "/api/v1/conversations", mint(t, a))); len(convs) != 1 {
+		t.Fatalf("após limpar: conversa deveria permanecer, got %d", len(convs))
+	}
+
+	// owner apaga: conversa some.
+	if rec := do(h, "DELETE", "/api/v1/conversations/"+id, mintRole(t, a, "margot", "owner")); rec.Code != http.StatusOK {
+		t.Fatalf("owner delete: status %d (body %s), want 200", rec.Code, rec.Body.String())
+	}
+	if convs := decodeConversations(t, do(h, "GET", "/api/v1/conversations", mint(t, a))); len(convs) != 0 {
+		t.Fatalf("após apagar: esperava 0 conversas, got %d", len(convs))
+	}
+}
+
 func TestAPIRejectsInvalidToken(t *testing.T) {
 	pool := testutil.Pool(t)
 	testutil.SetupControlPlane(t, pool)
@@ -555,6 +606,17 @@ func decodeConversations(t *testing.T, rec *httptest.ResponseRecorder) []convDTO
 		t.Fatalf("decode: %v (body: %s)", err, rec.Body.String())
 	}
 	return out.Conversations
+}
+
+func decodeMessages(t *testing.T, rec *httptest.ResponseRecorder) []map[string]any {
+	t.Helper()
+	var out struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v (body: %s)", err, rec.Body.String())
+	}
+	return out.Messages
 }
 
 // okReplier devolve uma resposta fixa (para gerar uma mensagem out/bot no seed).

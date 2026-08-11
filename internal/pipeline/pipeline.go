@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -35,16 +34,27 @@ import (
 const audioFallback = "Ainda não consigo ouvir áudios — pode me escrever por texto? 🙏"
 
 const (
-	produto           = "margot"
-	metricResposta    = "resposta" // billable unit: one AI reply sent
-	defaultHandoffMax = 15
-	historyLimit      = 20
-	kbMatches         = 3
+	produto        = "margot"
+	metricResposta = "resposta" // billable unit: one AI reply sent
+	historyLimit   = 20
+	kbMatches      = 3
 )
 
-// eventHandoffTriggered is a Margot-specific event appended to the platform
-// outbox (the kit defines only platform-wide event types).
-const eventHandoffTriggered = events.Type("HandoffTriggered")
+// appointmentMarker é o token que a IA anexa à resposta quando confirma um horário
+// com o cliente. O pipeline o remove antes de enviar e dispara o alerta de
+// agendamento — o cliente nunca vê o token (ver appointmentInstruction).
+const appointmentMarker = "[[AGENDAMENTO]]"
+
+// appointmentInstruction é anexada ao system prompt para ensinar a IA a sinalizar
+// um agendamento sem vazar o token para o cliente.
+const appointmentInstruction = "\n\nQuando você confirmar um horário, data ou compromisso específico com o cliente (um agendamento), acrescente EXATAMENTE o token " + appointmentMarker + " ao final da sua mensagem. Nunca mencione, explique ou exiba esse token para o cliente — ele é um sinal interno."
+
+// eventHandoffTriggered e eventAppointmentSignaled são eventos específicos da
+// Margot anexados ao outbox da plataforma (o kit define só os tipos globais).
+const (
+	eventHandoffTriggered    = events.Type("HandoffTriggered")
+	eventAppointmentSignaled = events.Type("AppointmentSignaled")
+)
 
 // Pipeline processes inbound WhatsApp messages for a tenant.
 type Pipeline struct {
@@ -53,7 +63,6 @@ type Pipeline struct {
 	replier     agent.Replier          // nil => reply with the tenant's fallback
 	transcriber transcribe.Transcriber // áudio → texto; Noop = desligado (fallback)
 	gate        *gating.Client
-	rules       *rulesCache
 	now         func() time.Time
 }
 
@@ -66,7 +75,6 @@ func New(pool *pgxpool.Pool, drivers *whatsapp.Registry, replier agent.Replier, 
 		replier:     replier,
 		transcriber: transcribe.NoopTranscriber{},
 		gate:        gate,
-		rules:       &rulesCache{pool: pool, ttl: 60 * time.Second},
 		now:         time.Now,
 	}
 }
@@ -129,18 +137,16 @@ func (p *Pipeline) Process(ctx context.Context, ch channel.TenantChannel, in wha
 	}
 
 	// 2) Read decision inputs.
-	count, autos, history, err := p.readState(ctx, ch, conv.ID)
+	count, sessionCount, autos, history, err := p.readState(ctx, ch, conv.ID)
 	if err != nil {
 		return err
 	}
 
-	// 3) Handoff rule (from product_rules; default 15).
-	handoffMax, err := p.rules.handoffMax(ctx)
-	if err != nil {
-		return err
-	}
-	if count > handoffMax {
-		return p.triggerHandoff(ctx, ch, conv.ID, count)
+	// 3) Handoff por VOLUME da sessão atual (limite por tenant; 0 = nunca automático).
+	// Conta só as mensagens desde o início da sessão do bot (bot_since) — antes usava
+	// o total acumulado e escalava "sem motivo" em qualquer conversa longa.
+	if ch.HandoffMax > 0 && sessionCount > int(ch.HandoffMax) {
+		return p.triggerHandoff(ctx, ch, conv.ID, sessionCount)
 	}
 
 	// 4) Automations may short-circuit the bot.
@@ -158,11 +164,46 @@ func (p *Pipeline) Process(ctx context.Context, ch channel.TenantChannel, in wha
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(reply) == "" {
+	// A IA sinaliza um agendamento anexando o token à resposta: removemos o token
+	// (o cliente nunca o vê) e disparamos o alerta depois de enviar a resposta.
+	reply, appointment := splitAppointment(reply)
+	reply = strings.TrimSpace(reply)
+	if reply != "" {
+		// The AI-generated reply is the billable unit ("resposta").
+		if err := p.sendAndRecord(ctx, ch, conv.ID, in.Phone, reply, "bot", true); err != nil {
+			return err
+		}
+	} else if !appointment {
 		return nil
 	}
-	// The AI-generated reply is the billable unit ("resposta").
-	return p.sendAndRecord(ctx, ch, conv.ID, in.Phone, reply, "bot", true)
+	if appointment {
+		return p.signalAppointment(ctx, ch, conv.ID)
+	}
+	return nil
+}
+
+// splitAppointment removes every appointmentMarker occurrence from the reply and
+// reports whether the AI signaled an appointment.
+func splitAppointment(reply string) (string, bool) {
+	if !strings.Contains(reply, appointmentMarker) {
+		return reply, false
+	}
+	return strings.ReplaceAll(reply, appointmentMarker, ""), true
+}
+
+// signalAppointment flags the conversation for attention (console + e-mail alert)
+// and emits AppointmentSignaled. It does NOT hand off — the bot keeps the
+// conversation; the owner is only notified that a time was confirmed.
+func (p *Pipeline) signalAppointment(ctx context.Context, ch channel.TenantChannel, convID uuid.UUID) error {
+	return p.withTenant(ctx, ch.TenantID, func(tx pgx.Tx) error {
+		if err := store.SetNeedsAttention(ctx, tx, convID, true, "A IA confirmou um horário — confira o agendamento"); err != nil {
+			return err
+		}
+		_, err := events.Publish(ctx, tx, eventAppointmentSignaled, ch.TenantID, produto, map[string]any{
+			"tenant_id": ch.TenantID.String(), "conversation_id": convID.String(),
+		})
+		return err
+	})
 }
 
 // withTenant runs fn inside a transaction scoped to the tenant's schema.
@@ -211,13 +252,16 @@ func (p *Pipeline) persistInbound(ctx context.Context, ch channel.TenantChannel,
 	return conv, isNew, err
 }
 
-func (p *Pipeline) readState(ctx context.Context, ch channel.TenantChannel, convID uuid.UUID) (int, []store.Automation, []store.Message, error) {
-	var count int
+func (p *Pipeline) readState(ctx context.Context, ch channel.TenantChannel, convID uuid.UUID) (int, int, []store.Automation, []store.Message, error) {
+	var count, sessionCount int
 	var autos []store.Automation
 	var history []store.Message
 	err := p.withTenant(ctx, ch.TenantID, func(tx pgx.Tx) error {
 		var err error
 		if count, err = store.CountMessages(ctx, tx, convID); err != nil {
+			return err
+		}
+		if sessionCount, err = store.CountSessionMessages(ctx, tx, convID); err != nil {
 			return err
 		}
 		if autos, err = store.ListAutomations(ctx, tx); err != nil {
@@ -226,7 +270,7 @@ func (p *Pipeline) readState(ctx context.Context, ch channel.TenantChannel, conv
 		history, err = store.ListRecentMessages(ctx, tx, convID, historyLimit)
 		return err
 	})
-	return count, autos, history, err
+	return count, sessionCount, autos, history, err
 }
 
 // triggerHandoff records the handoff, flips the conversation to human, and emits
@@ -237,6 +281,10 @@ func (p *Pipeline) triggerHandoff(ctx context.Context, ch channel.TenantChannel,
 			return err
 		}
 		if err := store.SetConversationMode(ctx, tx, convID, "human"); err != nil {
+			return err
+		}
+		// Destaque no console + alerta: a conversa precisa de humano, com o motivo.
+		if err := store.SetNeedsAttention(ctx, tx, convID, true, "Limite de mensagens da sessão atingido"); err != nil {
 			return err
 		}
 		_, err := events.Publish(ctx, tx, eventHandoffTriggered, ch.TenantID, produto, map[string]any{
@@ -256,7 +304,10 @@ func (p *Pipeline) applyAutomation(ctx context.Context, ch channel.TenantChannel
 	}
 	if dec.Handoff {
 		return p.withTenant(ctx, ch.TenantID, func(tx pgx.Tx) error {
-			return store.SetConversationMode(ctx, tx, convID, "human")
+			if err := store.SetConversationMode(ctx, tx, convID, "human"); err != nil {
+				return err
+			}
+			return store.SetNeedsAttention(ctx, tx, convID, true, "Automação encaminhou para atendimento humano")
 		})
 	}
 	return nil
@@ -312,6 +363,8 @@ func (p *Pipeline) generateReply(ctx context.Context, ch channel.TenantChannel, 
 		}
 		prompt = b.String()
 	}
+	// Ensina a IA a sinalizar agendamentos (token removido antes de enviar).
+	prompt += appointmentInstruction
 	return p.replier.Reply(ctx, ch.AIModel, prompt, toTurns(history), int(ch.MaxTokens))
 }
 
@@ -360,37 +413,4 @@ func optional(s string) *string {
 		return nil
 	}
 	return &s
-}
-
-// rulesCache caches product_rules (read-only from public) for a short TTL.
-type rulesCache struct {
-	pool *pgxpool.Pool
-	ttl  time.Duration
-
-	mu     sync.Mutex
-	at     time.Time
-	handMx int
-	loaded bool
-}
-
-func (c *rulesCache) handoffMax(ctx context.Context) (int, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.loaded && time.Since(c.at) < c.ttl {
-		return c.handMx, nil
-	}
-	var v *int
-	err := c.pool.QueryRow(ctx,
-		`SELECT (rules->>'handoff_max_mensagens')::int FROM public.product_rules WHERE produto = $1`, produto,
-	).Scan(&v)
-	if err != nil && err != pgx.ErrNoRows {
-		return 0, fmt.Errorf("read handoff_max: %w", err)
-	}
-	c.handMx = defaultHandoffMax
-	if v != nil {
-		c.handMx = *v
-	}
-	c.at = time.Now()
-	c.loaded = true
-	return c.handMx, nil
 }

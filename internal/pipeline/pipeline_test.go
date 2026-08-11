@@ -373,3 +373,44 @@ func TestHandoffAfterMax(t *testing.T) {
 		t.Fatalf("esperava evento HandoffTriggered, got %d", evts)
 	}
 }
+
+// TestAppointmentSignal: quando a IA anexa o token de agendamento, o pipeline o
+// remove antes de enviar, marca a conversa como "precisa de atenção" e emite
+// AppointmentSignaled — mas mantém a conversa no bot (não faz handoff).
+func TestAppointmentSignal(t *testing.T) {
+	pool := testutil.Pool(t)
+	testutil.SetupControlPlane(t, pool)
+	a := testutil.ProvisionTenant(t, pool, "inst-a")
+	ch := resolveChannel(t, pool, "inst-a")
+	ctx := context.Background()
+
+	mock := &whatsapp.MockSender{}
+	p := pipeline.New(pool, registry(mock), stubReplier{"Perfeito, agendei para amanhã às 10h. [[AGENDAMENTO]]"}, gating.New(pool))
+
+	if err := p.Process(ctx, ch, inbound("inst-a", "111", "podem me atender amanhã?")); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+
+	// O cliente recebe a resposta SEM o token.
+	if len(mock.Sent) != 1 {
+		t.Fatalf("esperava 1 mensagem enviada, got %d", len(mock.Sent))
+	}
+	if strings.Contains(mock.Sent[0].Text, "[[AGENDAMENTO]]") {
+		t.Fatalf("token de agendamento vazou para o cliente: %q", mock.Sent[0].Text)
+	}
+	// Conversa segue no bot, mas sinalizada para atenção.
+	if got := tenantCount(t, pool, a, "conversations", "WHERE mode='bot'"); got != 1 {
+		t.Fatalf("conversa deveria continuar no bot, got %d", got)
+	}
+	if got := tenantCount(t, pool, a, "conversations", "WHERE needs_attention"); got != 1 {
+		t.Fatalf("conversa deveria estar marcada para atenção, got %d", got)
+	}
+	var evts int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM public.event_outbox WHERE tenant_id=$1 AND type='AppointmentSignaled'`, a).Scan(&evts); err != nil {
+		t.Fatal(err)
+	}
+	if evts != 1 {
+		t.Fatalf("esperava 1 evento AppointmentSignaled, got %d", evts)
+	}
+}

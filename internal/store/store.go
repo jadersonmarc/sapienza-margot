@@ -66,11 +66,49 @@ func TouchConversation(ctx context.Context, tx DBTX, conversationID uuid.UUID) e
 	return nil
 }
 
-// SetConversationMode switches a conversation between "bot" and "human".
+// SetConversationMode switches a conversation between "bot" and "human". Voltar
+// para "bot" inicia uma NOVA sessão (bot_since = now) e limpa o "precisa de humano"
+// — assim o handoff por volume conta do zero e o alerta some.
 func SetConversationMode(ctx context.Context, tx DBTX, id uuid.UUID, mode string) error {
-	_, err := tx.Exec(ctx, `UPDATE conversations SET mode = $2 WHERE id = $1`, id, mode)
+	_, err := tx.Exec(ctx, `
+		UPDATE conversations
+		   SET mode = $2,
+		       bot_since = CASE WHEN $2 = 'bot' THEN now() ELSE bot_since END,
+		       needs_attention = CASE WHEN $2 = 'bot' THEN false ELSE needs_attention END,
+		       attention_reason = CASE WHEN $2 = 'bot' THEN '' ELSE attention_reason END
+		 WHERE id = $1`, id, mode)
 	if err != nil {
 		return fmt.Errorf("set conversation mode: %w", err)
+	}
+	return nil
+}
+
+// ClearConversation apaga todas as mensagens (e handoffs) da conversa, mas mantém
+// a conversa e o contato/lead, reiniciando-a como uma sessão nova do bot. Serve
+// para tirar da tela um histórico antigo que confunde a IA, sem perder o lead.
+func ClearConversation(ctx context.Context, tx DBTX, id uuid.UUID) error {
+	if _, err := tx.Exec(ctx, `DELETE FROM handoffs WHERE conversation_id = $1`, id); err != nil {
+		return fmt.Errorf("clear conversation handoffs: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM messages WHERE conversation_id = $1`, id); err != nil {
+		return fmt.Errorf("clear conversation messages: %w", err)
+	}
+	_, err := tx.Exec(ctx, `
+		UPDATE conversations
+		   SET mode = 'bot', status = 'open', bot_since = now(),
+		       needs_attention = false, attention_reason = '', last_message_at = NULL
+		 WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("clear conversation reset: %w", err)
+	}
+	return nil
+}
+
+// DeleteConversation remove a conversa inteira (mensagens e handoffs somem via
+// ON DELETE CASCADE). O contato/lead permanece no CRM.
+func DeleteConversation(ctx context.Context, tx DBTX, id uuid.UUID) error {
+	if _, err := tx.Exec(ctx, `DELETE FROM conversations WHERE id = $1`, id); err != nil {
+		return fmt.Errorf("delete conversation: %w", err)
 	}
 	return nil
 }
@@ -155,6 +193,32 @@ func CountMessages(ctx context.Context, tx DBTX, conversationID uuid.UUID) (int,
 	return n, nil
 }
 
+// CountSessionMessages conta as mensagens da SESSÃO atual do bot (>= bot_since).
+// É a base do handoff por volume — reseta quando a conversa volta para o bot,
+// então uma conversa longa não dispara "sem motivo" pelo total acumulado.
+func CountSessionMessages(ctx context.Context, tx DBTX, conversationID uuid.UUID) (int, error) {
+	var n int
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*) FROM messages m
+		  JOIN conversations c ON c.id = m.conversation_id
+		 WHERE m.conversation_id = $1 AND m.created_at >= c.bot_since`, conversationID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count session messages: %w", err)
+	}
+	return n, nil
+}
+
+// SetNeedsAttention marca (ou desmarca) a conversa como "precisa de humano", com o
+// motivo — o console destaca no topo do inbox e dispara o alerta.
+func SetNeedsAttention(ctx context.Context, tx DBTX, conversationID uuid.UUID, on bool, reason string) error {
+	_, err := tx.Exec(ctx,
+		`UPDATE conversations SET needs_attention = $2, attention_reason = $3 WHERE id = $1`,
+		conversationID, on, reason)
+	if err != nil {
+		return fmt.Errorf("set needs_attention: %w", err)
+	}
+	return nil
+}
+
 // InsertHandoff records a handoff for a conversation.
 func InsertHandoff(ctx context.Context, tx DBTX, conversationID uuid.UUID, reason string) error {
 	_, err := tx.Exec(ctx, `INSERT INTO handoffs (conversation_id, reason) VALUES ($1, $2)`, conversationID, reason)
@@ -221,10 +285,10 @@ func DeleteAutomation(ctx context.Context, tx DBTX, id uuid.UUID) error {
 // most recently active first.
 func ListConversations(ctx context.Context, tx DBTX, limit int) ([]ConversationView, error) {
 	rows, err := tx.Query(ctx, `
-		SELECT c.id, ct.phone, ct.name, c.mode, c.status, c.last_message_at
+		SELECT c.id, ct.phone, ct.name, c.mode, c.status, c.needs_attention, c.attention_reason, c.last_message_at
 		  FROM conversations c
 		  JOIN contacts ct ON ct.id = c.contact_id
-		 ORDER BY c.last_message_at DESC NULLS LAST
+		 ORDER BY c.needs_attention DESC, c.last_message_at DESC NULLS LAST
 		 LIMIT $1`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list conversations: %w", err)
@@ -233,7 +297,7 @@ func ListConversations(ctx context.Context, tx DBTX, limit int) ([]ConversationV
 	var out []ConversationView
 	for rows.Next() {
 		var v ConversationView
-		if err := rows.Scan(&v.ID, &v.ContactPhone, &v.ContactName, &v.Mode, &v.Status, &v.LastMessageAt); err != nil {
+		if err := rows.Scan(&v.ID, &v.ContactPhone, &v.ContactName, &v.Mode, &v.Status, &v.NeedsAttention, &v.AttentionReason, &v.LastMessageAt); err != nil {
 			return nil, err
 		}
 		out = append(out, v)
